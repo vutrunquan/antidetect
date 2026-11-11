@@ -74,22 +74,26 @@ def send_tiktok_beta_success_report(
         return
 
     now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-    safe_channel = html.escape(source_handle or "Kênh nguồn")
-    safe_acc = html.escape(account_id or "acc_n/a")
-    safe_user = html.escape(tiktok_user or "N/A")
-    safe_title = html.escape(shorts_title)
-    safe_caption = html.escape(caption_text)
+    safe_channel = html.escape(str(source_handle or "Kênh nguồn"))
+    safe_acc = html.escape(str(account_id or "acc_n/a"))
+    safe_user = html.escape(str(tiktok_user or "N/A"))
+    safe_vpn = html.escape(str(vpn_region or "VN"))
+    safe_profile = html.escape(str(profile_name or "Default"))
+    safe_title = html.escape(str(shorts_title or ""))
+    safe_quality = html.escape(str(quality_str or ""))
+    safe_check = html.escape(str(check_status or "").split("\n")[0].strip())
+    safe_caption = html.escape(str(caption_text or ""))
 
     msg = (
         f"🎉 <b>[TIKTOK BETA] ĐĂNG VIDEO THÀNH CÔNG!</b>\n\n"
         f"👤 <b>Kênh nhận:</b> {safe_channel} ({safe_acc})\n"
         f"🎵 <b>TikTok User:</b> {safe_user}\n"
-        f"🌐 <b>Vùng VPN:</b> {vpn_region} | <b>Profile:</b> {profile_name}\n"
+        f"🌐 <b>Vùng VPN:</b> {safe_vpn} | <b>Profile:</b> {safe_profile}\n"
         f"----------------------------------------\n"
         f"🎬 <b>Tiêu đề Shorts:</b> {safe_title}\n"
-        f"📐 <b>Chất lượng thực tế:</b> {quality_str}\n"
+        f"📐 <b>Chất lượng thực tế:</b> {safe_quality}\n"
         f"⏱ <b>Thời lượng:</b> {duration}s (Chuẩn ≤ 59s)\n"
-        f"🛡 <b>Kiểm tra:</b> {check_status}\n"
+        f"🛡 <b>Kiểm tra:</b> {safe_check}\n"
         f"⏰ <b>Thời gian đăng:</b> {now_str}\n\n"
         f"📝 <b>Caption đăng tải:</b>\n"
         f"<blockquote>{safe_caption}</blockquote>\n\n"
@@ -103,6 +107,12 @@ def send_tiktok_beta_success_report(
         bot.send_message(chat_id, msg, reply_markup=markup, disable_web_page_preview=True)
     except Exception as e:
         print(f"[Telegram Success Report Error]: {e}")
+        try:
+            import re
+            clean_text = re.sub(r"<[^>]+>", "", msg)
+            bot.send_message(chat_id, clean_text, reply_markup=markup, disable_web_page_preview=True, parse_mode=None)
+        except Exception:
+            pass
 
 def send_daily_kpi_report(target_date: str = None):
     """
@@ -238,10 +248,20 @@ def send_telegram_report_with_buttons(
         return
 
     now_str = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-    safe_channel = html.escape(source_channel)
-    safe_user = html.escape(tiktok_user)
-    safe_title = html.escape(shorts_title)
-    safe_caption = html.escape(caption_text)
+    safe_channel = html.escape(str(source_channel or "Kênh nguồn"))
+    safe_user = html.escape(str(tiktok_user or "N/A"))
+    safe_title = html.escape(str(shorts_title or ""))
+    safe_caption = html.escape(str(caption_text or ""))
+    safe_vpn = html.escape(str(vpn_region or "VN"))
+    safe_profile = html.escape(str(profile_name or "Default"))
+    safe_quality = html.escape(str(quality_str or ""))
+
+    # Lọc bỏ lỗi dài, lấy dòng đầu tiên và escape HTML an toàn cho Telegram
+    raw_check = str(check_status or "").split("\n")[0].strip()
+    if len(raw_check) > 150:
+        raw_check = raw_check[:147] + "..."
+    safe_check_status = html.escape(raw_check)
+    safe_yt_status = html.escape(str(yt_status or ""))
 
     if action == "PUBLISHED" or yt_status == "PUBLISHED":
         header = "🎉 <b>[AUTO ĐĂNG BÀI] HOÀN TẤT XỬ LÝ VIDEO!</b>"
@@ -253,22 +273,22 @@ def send_telegram_report_with_buttons(
     tt_line = ""
     if tiktok_user:
         shield = "🛡️ " if action == "PUBLISHED" else ("🚨 " if action == "DRAFTED" else "⏳ ")
-        tt_line = f"🎵 <b>TikTok ({safe_user}):</b> {shield}{check_status}\n"
+        tt_line = f"🎵 <b>TikTok ({safe_user}):</b> {shield}{safe_check_status}\n"
 
     yt_line = ""
     if yt_status != "NONE":
         yt_shield = "🎬 " if yt_status == "PUBLISHED" else "⚠️ "
-        yt_line = f"📺 <b>YouTube Studio:</b> {yt_shield}{yt_status}\n"
+        yt_line = f"📺 <b>YouTube Studio:</b> {yt_shield}{safe_yt_status}\n"
         if yt_video_url:
             yt_line += f"   👉 <a href=\"{yt_video_url}\">Link Shorts đã đăng</a>\n"
 
     message_html = (
         f"{header}\n\n"
         f"👤 <b>Kênh nguồn:</b> {safe_channel}\n"
-        f"🌐 <b>Vùng VPN:</b> {vpn_region} | <b>Profile:</b> {profile_name}\n"
+        f"🌐 <b>Vùng VPN:</b> {safe_vpn} | <b>Profile:</b> {safe_profile}\n"
         f"----------------------------------------\n"
         f"🎬 <b>Tiêu đề Shorts:</b> {safe_title}\n"
-        f"📐 <b>Chất lượng thực tế:</b> {quality_str}\n"
+        f"📐 <b>Chất lượng thực tế:</b> {safe_quality}\n"
         f"⏱️ <b>Thời lượng:</b> {duration}s (Chuẩn ≤ 59s)\n"
         f"----------------------------------------\n"
         f"{tt_line}"
@@ -289,6 +309,18 @@ def send_telegram_report_with_buttons(
         )
     except Exception as e:
         print(f"[Telegram Send Error]: {e}")
+        try:
+            import re
+            clean_text = re.sub(r"<[^>]+>", "", message_html)
+            bot.send_message(
+                chat_id=chat_id,
+                text=clean_text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+                parse_mode=None
+            )
+        except Exception:
+            pass
 
 def _register_handlers(bot: telebot.TeleBot):
     @bot.callback_query_handler(func=lambda call: True)

@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import random
+import shutil
 import sqlite3
 import threading
 import subprocess
@@ -470,7 +471,14 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10) -> dict 
     """Quét và tải video Shorts mới nhất chưa từng được xử lý (thời lượng chuẩn ≤ 59s)."""
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
-    ydl_info_opts = {'extract_flat': True, 'playlist_items': f'1-{max_lookback}', 'quiet': True}
+    node_bin = shutil.which("node")
+    js_runtimes = {"node": {}} if node_bin else {}
+    ydl_info_opts = {
+        'extract_flat': True,
+        'playlist_items': f'1-{max_lookback}',
+        'quiet': True,
+        'js_runtimes': js_runtimes
+    }
     with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
         try:
             info = ydl.extract_info(channel_shorts_url, download=False)
@@ -504,7 +512,8 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10) -> dict 
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': raw_path,
         'merge_output_format': 'mp4',
-        'quiet': True
+        'quiet': True,
+        'js_runtimes': js_runtimes
     }
     with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl:
         full_info = ydl.extract_info(video_url, download=True)
@@ -572,14 +581,54 @@ def open_profile_warmup(profile_dir: str, proxy_server: str = "", target_url: st
             while len(context.pages) > 0:
                 time.sleep(1)
 
+def dismiss_tiktok_popups(page, logger=None):
+    """
+    Tự động tắt các popup, overlay hướng dẫn (Joyride tour / tooltips / modal) của TikTok Studio
+    để tránh lỗi <div class="react-joyride__overlay"> subtree intercepts pointer events.
+    """
+    try:
+        page.evaluate("""() => {
+            try {
+                const joyride = document.getElementById('react-joyride-portal');
+                if (joyride) joyride.remove();
+                document.querySelectorAll('.react-joyride__overlay, .react-joyride__spotlight, [class*="joyride"], .tiktok-modal-mask').forEach(el => el.remove());
+            } catch (e) {}
+        }""")
+    except Exception:
+        pass
+
+    for sel in [
+        '#react-joyride-portal button[aria-label="Close"]',
+        '#react-joyride-portal button:has-text("Skip")',
+        '#react-joyride-portal button:has-text("Got it")',
+        '#react-joyride-portal button:has-text("Bỏ qua")',
+        '#react-joyride-portal button:has-text("Đã hiểu")',
+        'div[role="dialog"] button:has-text("Got it")',
+        'div[role="dialog"] button:has-text("Đã hiểu")',
+        'div[role="dialog"] button:has-text("Bỏ qua")',
+        'button:has-text("Got it")',
+        'button:has-text("Đã hiểu")',
+        'button:has-text("Dismiss")',
+        'button[aria-label="Close"]',
+        'button[aria-label="Đóng"]'
+    ]:
+        try:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click(force=True, timeout=1000)
+        except Exception:
+            pass
+
 def wait_for_content_check(page, max_wait_seconds: int = 90) -> tuple[bool, str]:
     """
     Theo dõi kết quả Content Check Lite trên TikTok Studio.
     Trả về (is_green, status_text)
     """
     polls = max(1, max_wait_seconds // 3)
-    for _ in range(polls):
+    for p_idx in range(polls):
         time.sleep(3)
+        if p_idx % 3 == 0:
+            dismiss_tiktok_popups(page)
         try:
             body_text = page.inner_text("body")
         except Exception:
@@ -635,6 +684,7 @@ def upload_to_tiktok_with_fallback(
                 _log("🌐 Điều hướng đến TikTok Studio Upload...")
                 page.goto("https://www.tiktok.com/tiktokstudio/upload", timeout=60000)
                 time.sleep(3)
+                dismiss_tiktok_popups(page, _log)
 
                 # Kiểm tra nếu chưa đăng nhập -> Thử auto login nếu profile có lưu tài khoản
                 if "login" in page.url or page.locator('button:has-text("Log in"), button:has-text("Đăng nhập")').count() > 0:
@@ -650,11 +700,13 @@ def upload_to_tiktok_with_fallback(
                                 auto_login_tiktok(page, acfg["creds"], logger=_log)
                                 time.sleep(4)
                                 page.goto("https://www.tiktok.com/tiktokstudio/upload", timeout=60000)
+                                dismiss_tiktok_popups(page, _log)
                         except Exception as e:
                             _log(f"❌ Auto login thất bại: {e}")
 
                 # 1. Tải file video 4K lần 1
                 _log("📁 Đang đưa file video vào trình tải lên TikTok...")
+                dismiss_tiktok_popups(page, _log)
                 file_input = page.locator('input[type="file"]')
                 file_input.wait_for(state="attached", timeout=35000)
                 file_input.set_input_files(video_4k_path)
@@ -662,15 +714,23 @@ def upload_to_tiktok_with_fallback(
 
                 # 2. Nhập Caption & Hashtag
                 _log("✍️ Đang nhập Caption và Hashtags SEO...")
-                caption_box = page.locator('div[contenteditable="true"]').first
+                dismiss_tiktok_popups(page, _log)
+                caption_box = page.locator('div[contenteditable="true"], div.public-DraftEditor-content, div[role="combobox"]').first
                 caption_box.wait_for(state="visible", timeout=30000)
-                caption_box.click()
+                try:
+                    caption_box.click(timeout=3000)
+                except Exception:
+                    dismiss_tiktok_popups(page, _log)
+                    caption_box.click(force=True)
 
                 # Xóa sạch text mặc định
                 page.keyboard.press(SELECT_ALL_SHORTCUT)
                 page.keyboard.press("Backspace")
                 time.sleep(0.5)
-                caption_box.fill(caption)
+                try:
+                    caption_box.fill(caption)
+                except Exception:
+                    page.keyboard.type(caption, delay=20)
                 time.sleep(1)
 
                 # 3. Đợi kết quả Content Check Lite lần 1
@@ -682,33 +742,97 @@ def upload_to_tiktok_with_fallback(
                 if not is_green:
                     _log("🚨 Phát hiện cảnh báo bản quyền âm thanh! Đang kích hoạt cứu hộ tầng 1 (Remedy Audio Fast)...")
                     remedied_path = video_4k_path.replace(".mp4", "_remedy.mp4")
-                    remedy_audio_fast(video_4k_path, remedied_path)
+                    try:
+                        remedy_audio_fast(video_4k_path, remedied_path)
+                    except Exception as e_rem:
+                        _log(f"⚠️ Lỗi xử lý âm thanh remedy: {e_rem}")
+                        remedied_path = video_4k_path
 
-                    replace_btn = page.locator('button:has-text("Replace"), button:has-text("Thay thế"), button:has-text("Reemplazar")').first
-                    if replace_btn.is_visible():
-                        replace_btn.click()
-                        time.sleep(2)
-                        confirm_btn = page.locator('button:has-text("Replace"), button:has-text("Continue"), button:has-text("Tiếp tục"), button:has-text("Continuar")').first
-                        if confirm_btn.is_visible():
-                            confirm_btn.click()
+                    dismiss_tiktok_popups(page, _log)
+
+                    replaced_successfully = False
+                    replace_btn = page.locator(
+                        'button:has-text("Replace"), button:has-text("Thay thế"), button:has-text("Reemplazar"), button:has-text("Change video"), button:has-text("Đổi video")'
+                    ).first
+                    try:
+                        if replace_btn.is_visible():
+                            replace_btn.click(force=True, timeout=3000)
+                            time.sleep(2)
+                            dismiss_tiktok_popups(page, _log)
+                            for conf_sel in [
+                                'div[role="dialog"] button:has-text("Replace")',
+                                'div[role="dialog"] button:has-text("Continue")',
+                                'div[role="dialog"] button:has-text("Tiếp tục")',
+                                'div[role="dialog"] button:has-text("Continuar")',
+                                'div[role="dialog"] button:has-text("Discard")',
+                                'div[role="dialog"] button:has-text("Bỏ")'
+                            ]:
+                                c_btn = page.locator(conf_sel).first
+                                if c_btn.is_visible():
+                                    c_btn.click(force=True, timeout=2000)
+                                    time.sleep(1)
+                                    break
+
+                            file_input = page.locator('input[type="file"]')
+                            file_input.wait_for(state="attached", timeout=6000)
+                            file_input.set_input_files(remedied_path)
+                            replaced_successfully = True
+                            _log("🔄 Đã thay thế video trực tiếp bằng nút Replace.")
+                    except Exception as e_rep:
+                        _log(f"⚠️ Thao tác replace trực tiếp không khả dụng ({e_rep}), chuyển sang nạp lại trang upload...")
+
+                    # Fallback vững chắc: nếu Replace in-place thất bại -> load lại trang upload
+                    if not replaced_successfully:
+                        _log("🌐 Tải lại trang upload TikTok Studio để nạp video đã sửa âm thanh...")
+                        try:
+                            page.on("dialog", lambda dialog: dialog.accept())
+                        except Exception:
+                            pass
+                        page.goto("https://www.tiktok.com/tiktokstudio/upload", timeout=60000, wait_until="domcontentloaded")
+                        time.sleep(3)
+                        dismiss_tiktok_popups(page, _log)
+
+                        file_input = page.locator('input[type="file"]')
+                        file_input.wait_for(state="attached", timeout=35000)
+                        file_input.set_input_files(remedied_path)
+                        time.sleep(3)
+
+                        _log("✍️ Nhập lại Caption sau khi tải lại trang...")
+                        dismiss_tiktok_popups(page, _log)
+                        caption_box = page.locator('div[contenteditable="true"], div.public-DraftEditor-content, div[role="combobox"]').first
+                        caption_box.wait_for(state="visible", timeout=30000)
+                        try:
+                            caption_box.click(timeout=3000)
+                        except Exception:
+                            dismiss_tiktok_popups(page, _log)
+                            caption_box.click(force=True)
+
+                        page.keyboard.press(SELECT_ALL_SHORTCUT)
+                        page.keyboard.press("Backspace")
+                        time.sleep(0.5)
+                        try:
+                            caption_box.fill(caption)
+                        except Exception:
+                            page.keyboard.type(caption, delay=20)
                         time.sleep(1)
 
-                    file_input = page.locator('input[type="file"]')
-                    file_input.wait_for(state="attached", timeout=25000)
-                    file_input.set_input_files(remedied_path)
                     _log("🔄 Đã nạp video đã sửa âm thanh, đang đợi Content Check Lite quét lại...")
-
                     is_green, check_status = wait_for_content_check(page)
                     if is_green:
                         check_status = "Content Check Lite: HỢP LỆ (XANH - ĐÃ FIX AUDIO)"
                     _log(f"🔎 Kết quả kiểm tra lần 2: {check_status}")
 
                 # 5. QUYẾT ĐỊNH ĐĂNG HOẶC LƯU NHÁP (TẦNG 2)
+                dismiss_tiktok_popups(page, _log)
                 if is_green:
                     _log("🚀 Video đạt chuẩn bản quyền! Đang bấm nút Đăng (Post)...")
                     post_btn = page.locator('button:has-text("Post"), button:has-text("Đăng"), button:has-text("Publicar")').last
                     post_btn.scroll_into_view_if_needed()
-                    post_btn.click()
+                    try:
+                        post_btn.click(timeout=5000)
+                    except Exception:
+                        dismiss_tiktok_popups(page, _log)
+                        post_btn.click(force=True)
                     time.sleep(8)
                     _log("✅ Đã xuất bản thành công lên TikTok!")
                     return {"action": "PUBLISHED", "check_status": check_status}
@@ -722,14 +846,19 @@ def upload_to_tiktok_with_fallback(
                         'button:has-text("Guardar en borradores")'
                     ).first
                     draft_btn.scroll_into_view_if_needed()
-                    draft_btn.click()
+                    try:
+                        draft_btn.click(timeout=5000)
+                    except Exception:
+                        dismiss_tiktok_popups(page, _log)
+                        draft_btn.click(force=True)
                     time.sleep(6)
                     _log("🛡️ Đã lưu an toàn vào bản nháp TikTok!")
                     return {"action": "DRAFTED", "check_status": "Content Check Lite: CẢNH BÁO (ĐÃ LƯU NHÁP AN TOÀN)"}
 
             except Exception as e:
-                _log(f"❌ Lỗi quy trình TikTok Studio: {e}")
-                return {"action": "FAILED", "check_status": f"LỖI TIKTOK: {e}"}
+                err_msg = str(e).split("\n")[0].strip()
+                _log(f"❌ Lỗi quy trình TikTok Studio: {err_msg}")
+                return {"action": "FAILED", "check_status": f"LỖI TIKTOK: {err_msg}"}
 
 # ================= 5. YOUTUBE SHORTS STUDIO (CAMOUFOX) =================
 def upload_to_youtube_studio(
@@ -890,25 +1019,41 @@ def force_publish_draft(video_record: dict, log_callback = None) -> bool:
                 _log("🌐 Mở TikTok Studio Content Manager...")
                 page.goto("https://www.tiktok.com/tiktokstudio/content", timeout=60000)
                 time.sleep(4)
+                dismiss_tiktok_popups(page, _log)
 
                 draft_tab = page.locator('text="Drafts", text="Bản nháp", text="Borradores"').first
                 if draft_tab.is_visible():
-                    draft_tab.click()
+                    try:
+                        draft_tab.click(timeout=3000)
+                    except Exception:
+                        draft_tab.click(force=True)
                     time.sleep(3)
 
                 edit_btn = page.locator('button:has-text("Edit"), button:has-text("Chỉnh sửa"), button:has-text("Editar")').first
                 edit_btn.wait_for(state="visible", timeout=20000)
-                edit_btn.click()
+                try:
+                    edit_btn.click(timeout=3000)
+                except Exception:
+                    dismiss_tiktok_popups(page, _log)
+                    edit_btn.click(force=True)
 
+                dismiss_tiktok_popups(page, _log)
                 post_btn = page.locator('button:has-text("Post"), button:has-text("Đăng"), button:has-text("Publicar")').last
                 post_btn.wait_for(state="visible", timeout=30000)
                 post_btn.scroll_into_view_if_needed()
-                post_btn.click()
+                try:
+                    post_btn.click(timeout=5000)
+                except Exception:
+                    dismiss_tiktok_popups(page, _log)
+                    post_btn.click(force=True)
 
                 time.sleep(2)
                 confirm_btn = page.locator('button:has-text("Post now"), button:has-text("Continue"), button:has-text("Vẫn đăng"), button:has-text("Continuar")').first
                 if confirm_btn.is_visible():
-                    confirm_btn.click()
+                    try:
+                        confirm_btn.click(timeout=3000)
+                    except Exception:
+                        confirm_btn.click(force=True)
 
                 time.sleep(8)
                 _log("✅ Đã phát hành bản nháp thành công!")

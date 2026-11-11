@@ -170,7 +170,34 @@ def handle_tiktok_verification_challenge(page, email: str, refresh_token: str, c
                 logger(f"[*] Tìm thấy ô phương thức Email ({txt}). Đang click để nhận mã...")
                 loc.click(force=True)
                 email_option_clicked = True
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(1000)
+
+                # Bấm nút 'Next' / 'Siguiente' / 'Tiếp tục' / 'Send code' nếu có trong modal sau khi chọn email
+                for next_sel in [
+                    '#idv-modal-container button:has-text("Next")',
+                    '#idv-modal-container button:has-text("Siguiente")',
+                    '#idv-modal-container button:has-text("Tiếp tục")',
+                    '#idv-modal-container button:has-text("Continuar")',
+                    '#idv-modal-container button:has-text("Send code")',
+                    '#idv-modal-container button:has-text("Enviar código")',
+                    'div[role="dialog"] button:has-text("Next")',
+                    'div[role="dialog"] button:has-text("Siguiente")',
+                    'div[role="dialog"] button:has-text("Tiếp tục")',
+                    'div[role="dialog"] button:has-text("Continuar")',
+                    'div[role="dialog"] button:has-text("Send code")',
+                    'div[role="dialog"] button:has-text("Enviar código")',
+                    '#idv-modal-container button[type="submit"]',
+                    'div[role="dialog"] button[type="submit"]'
+                ]:
+                    try:
+                        n_btn = page.locator(next_sel)
+                        if n_btn.count() > 0 and n_btn.first.is_visible() and n_btn.first.is_enabled():
+                            logger(f"[*] Bấm nút tiếp tục sau khi chọn email: {next_sel}")
+                            n_btn.first.click()
+                            page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        pass
                 break
             except Exception as e:
                 logger(f"[!] Thử click ô email: {e}")
@@ -235,10 +262,20 @@ def handle_tiktok_verification_challenge(page, email: str, refresh_token: str, c
     # BƯỚC 4: Điền mã OTP 6 số vào ô
     logger(f"[*] Điền mã OTP ({new_otp}) vào ô xác minh...")
     try:
-        code_input.click()
-        page.wait_for_timeout(200)
-        code_input.fill("")
-        code_input.type(new_otp, delay=70)
+        inputs = page.locator('#idv-modal-container input, div[role="dialog"] input')
+        visible_inputs = [inputs.nth(i) for i in range(inputs.count()) if inputs.nth(i).is_visible()]
+        if len(visible_inputs) == 6:
+            logger("[*] Phát hiện 6 ô nhập mã riêng biệt. Đang điền từng số...")
+            for idx, digit in enumerate(new_otp[:6]):
+                inp = visible_inputs[idx]
+                inp.click()
+                inp.fill(digit)
+                page.wait_for_timeout(80)
+        else:
+            code_input.click()
+            page.wait_for_timeout(200)
+            code_input.fill("")
+            code_input.type(new_otp, delay=70)
         page.wait_for_timeout(800)
     except Exception as e:
         logger(f"[!] Lỗi khi điền mã OTP: {e}")
