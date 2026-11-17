@@ -1,0 +1,20 @@
+================================================================================
+   [04] TRÌNH DUYỆT ANTIDETECT & AUTO POST TIKTOK (CAMOUFOX)
+================================================================================
+
+1. CHỨC NĂNG CHÍNH:
+   - Trình duyệt ẩn danh chống phát hiện bot cao cấp dựa trên Camoufox:
+     + Fake vân tay trình duyệt (Fingerprint, WebGL, Canvas, AudioContext, Geo, UserAgent).
+     + Mỗi profile là một thiết bị sạch độc lập, không bị phát hiện liên kết tài khoản.
+     + Hỗ trợ đăng nhập TikTok lấy mã xác thực OTP tự động.
+     + Hỗ trợ nuôi nick và tự động đăng video lên TikTok an toàn, chống quét/bóp tương tác.
+
+2. CÁCH KHỞI ĐỘNG NHANH:
+   - Bấm đúp vào file "▶_CHAY_ANTIDETECT_TIKTOK.bat" (hoặc "Chay_App_Windows.bat").
+   - Hoặc mở nhanh icon "Camoufox Antidetect.lnk" ngay ngoài màn hình Desktop.
+
+3. DỮ LIỆU PROFILE:
+   - Các profile trình duyệt và cookie được lưu độc lập trong thư mục: .\profiles
+   - Cơ sở dữ liệu: .\tiktok_bot_system.db
+================================================================================
+

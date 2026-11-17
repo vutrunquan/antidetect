@@ -147,7 +147,7 @@ def generate_seo_metadata(
         try:
             client = genai.Client(api_key=api_key)
             prompt = f"""
-Bạn là TikTok Viral Strategist & Video Optimization Specialist hàng đầu từ Agency Agents (msitarzewski/agency-agents). Áp dụng quy tắc ngắt dòng suy nghĩ (Pattern Interrupt), giật Hook 3s đầu và giữ chân người xem.
+Bạn là chuyên gia Content Creator & Viral SEO hàng đầu thế giới cho TikTok và YouTube Shorts.
 Hãy phân tích thông tin video dưới đây và sáng tạo bộ Metadata SEO hoàn chỉnh tối ưu thuật toán tìm kiếm và đề xuất FYP:
 - Tên file / Chủ đề video: "{clean_topic}"
 - Ngách nội dung (Niche): "{niche_hint if niche_hint else 'Tự động nhận diện theo chủ đề'}"
@@ -222,4 +222,128 @@ def _build_fallback_seo(clean_topic: str, region_code: str) -> dict:
         "description": fallback_desc,
         "hashtags": fallback_tags
     }
+
+class HashtagsOnlySchema(BaseModel):
+    hashtags: list[str] = Field(description="10-12 hashtag viết thường có dấu '#', 70% ngôn ngữ vùng mục tiêu và 30% tiếng Anh.")
+
+def _dedup_hashtags(raw_tags: list[str], existing_text: str = "") -> list[str]:
+    """Chuẩn hóa định dạng #tag, loại bỏ trùng lặp và bỏ các tag đã có sẵn trong tiêu đề."""
+    existing = set(re.findall(r"#[\w]+", existing_text.lower()))
+    result = []
+    for t in raw_tags:
+        tag = t.strip().lower()
+        if not tag:
+            continue
+        if not tag.startswith("#"):
+            tag = f"#{tag}"
+        if tag not in existing and tag not in result:
+            result.append(tag)
+    return result
+
+def generate_localized_hashtags(original_title: str, target_region: str = "VN", niche_hint: str = "") -> list[str]:
+    """Chỉ sinh bộ hashtag bản địa phù hợp với tiêu đề gốc và vùng mục tiêu."""
+    clean_topic = clean_filename_to_title(original_title)
+    region_code = target_region.upper() if target_region else "VN"
+    target_lang = REGION_LANGUAGE_MAP.get(region_code, f"ngôn ngữ quốc gia {region_code}")
+
+    cfg = load_config()
+    api_key = cfg.get("gemini_api_key", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+
+    if api_key and HAS_GENAI:
+        try:
+            client = genai.Client(api_key=api_key)
+            prompt = (
+                f'Tạo 10-12 hashtag TikTok/Shorts phù hợp nhất cho video có tiêu đề "{original_title}" '
+                f'(ngách: "{niche_hint or "tự nhận diện"}", vùng mục tiêu: {region_code} - {target_lang}). '
+                f'Yêu cầu 70% hashtag bằng ngôn ngữ {target_lang} và 30% hashtag tiếng Anh phổ biến.'
+            )
+            response = generate_with_fallback(
+                client,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=HashtagsOnlySchema,
+                    temperature=0.6,
+                ),
+            )
+            res: HashtagsOnlySchema = response.parsed
+            return _dedup_hashtags(res.hashtags, original_title)
+        except Exception as e:
+            print(f"[Gemini Hashtags Fallback]: {e}")
+
+    fallback_tags = _build_fallback_seo(clean_topic, region_code).get("hashtags", [])
+    return _dedup_hashtags(fallback_tags, original_title)
+
+def _is_missing_text(value: str) -> bool:
+    """Kiểm tra tiêu đề/mô tả gốc có bị trống hoặc chỉ là chuỗi giữ chỗ mặc định hay không."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return True
+    return cleaned.lower() in ("shorts video", "untitled", "none")
+
+def build_caption_metadata(
+    original_title: str,
+    target_region: str = "VN",
+    niche_hint: str = "",
+    title_mode: str = "ai_rewrite",
+    original_description: str = "",
+    existing_hashtags: str | list[str] = "",
+    fallback_topic: str = "",
+) -> dict:
+    """
+    Tạo metadata đăng bài theo chế độ kênh:
+    - 'keep_original': Giữ tiêu đề & mô tả gốc; nếu tiêu đề hoặc mô tả gốc bị trống sẽ tự động gọi AI viết bù phần còn thiếu.
+    - 'ai_rewrite': AI viết lại hoàn toàn tiêu đề giật tít, mô tả SEO và hashtag bản địa.
+    """
+    clean_title = (original_title or "").strip().replace("\n", " ")
+    clean_desc = (original_description or "").strip()
+    has_title = not _is_missing_text(clean_title)
+    has_desc = not _is_missing_text(clean_desc)
+
+    if isinstance(existing_hashtags, list):
+        manual_tags = _dedup_hashtags(existing_hashtags)
+    else:
+        manual_tags = _dedup_hashtags((existing_hashtags or "").split())
+
+    mode = (title_mode or "ai_rewrite").strip().lower()
+    if mode == "keep_original":
+        # Trường hợp 1: Có đủ cả tiêu đề gốc và mô tả gốc -> giữ nguyên hoàn toàn
+        if has_title and has_desc:
+            tags = manual_tags or generate_localized_hashtags(
+                f"{clean_title} {clean_desc}",
+                target_region=target_region,
+                niche_hint=niche_hint,
+            )
+            tags = _dedup_hashtags(tags, f"{clean_title} {clean_desc}")
+            return {
+                "title": clean_title,
+                "hook_caption": "",
+                "description": clean_desc,
+                "hashtags": tags,
+            }
+
+        # Trường hợp 2: Thiếu tiêu đề gốc hoặc thiếu mô tả gốc -> tự động dùng AI viết bù phần thiếu
+        ai_topic = clean_title if has_title else (clean_desc if has_desc else (fallback_topic or niche_hint or "Shorts Video"))
+        ai_meta = generate_seo_metadata(
+            topic_or_filename=ai_topic,
+            target_region=target_region,
+            niche_hint=niche_hint,
+        )
+        final_title = clean_title if has_title else ai_meta.get("title", "Shorts Video")
+        final_desc = clean_desc if has_desc else ai_meta.get("description", "")
+        raw_tags = manual_tags if manual_tags else ai_meta.get("hashtags", [])
+        final_tags = _dedup_hashtags(raw_tags, f"{final_title} {final_desc}")
+        return {
+            "title": final_title,
+            "hook_caption": "" if has_title else ai_meta.get("hook_caption", ""),
+            "description": final_desc,
+            "hashtags": final_tags,
+        }
+
+    topic_for_ai = clean_title if has_title else (clean_desc if has_desc else (fallback_topic or niche_hint or "Shorts Video"))
+    return generate_seo_metadata(
+        topic_or_filename=topic_for_ai,
+        target_region=target_region,
+        niche_hint=niche_hint,
+    )
 

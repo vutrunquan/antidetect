@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 
 from ai_seo_helper import (
     TikTokCaptionSchema, VideoSEOMetadataSchema,
-    generate_localized_caption, generate_seo_metadata, clean_filename_to_title
+    generate_localized_caption, generate_seo_metadata,
+    build_caption_metadata, clean_filename_to_title
 )
 
 from platform_utils import (
@@ -23,6 +24,11 @@ from platform_utils import (
     get_subprocess_kwargs, detect_best_video_encoder, load_config
 )
 from browser_runner import parse_proxy
+from video_remix_engine import (
+    render_anti_copyright_video,
+    remedy_audio_with_bgm,
+    probe_video_metrics
+)
 from camoufox.sync_api import Camoufox
 from camoufox.fingerprints import Screen
 
@@ -117,6 +123,7 @@ def init_db():
         niche TEXT,
         daily_target INTEGER DEFAULT 2,
         status TEXT DEFAULT 'ACTIVE',
+        title_mode TEXT DEFAULT 'ai_rewrite',
         post_to_tiktok INTEGER DEFAULT 1,
         post_to_youtube INTEGER DEFAULT 1,
         created_at TEXT DEFAULT ''
@@ -128,6 +135,7 @@ def init_db():
         ("source_handle", "TEXT DEFAULT ''"),
         ("daily_target", "INTEGER DEFAULT 2"),
         ("status", "TEXT DEFAULT 'ACTIVE'"),
+        ("title_mode", "TEXT DEFAULT 'ai_rewrite'"),
         ("post_to_tiktok", "INTEGER DEFAULT 1"),
         ("post_to_youtube", "INTEGER DEFAULT 1"),
         ("created_at", "TEXT DEFAULT ''")
@@ -245,13 +253,15 @@ def add_tracked_channel(
     account_id: str = "",
     source_handle: str = "",
     daily_target: int = 2,
-    status: str = "ACTIVE"
+    status: str = "ACTIVE",
+    title_mode: str = "ai_rewrite"
 ):
     norm_url, parsed_handle = parse_youtube_channel_input(yt_url)
     if not source_handle:
         source_handle = parsed_handle
     if not account_id:
         account_id = generate_account_id()
+    norm_title_mode = "keep_original" if str(title_mode).strip().lower() == "keep_original" else "ai_rewrite"
 
     if not profile_dir:
         profile_dir = os.path.join(BASE_DIR, "profiles", profile_name.replace(" ", "_"))
@@ -261,10 +271,10 @@ def add_tracked_channel(
     conn.execute("""
     INSERT OR REPLACE INTO channels 
     (youtube_shorts_url, tiktok_user, vpn_region, profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-     account_id, source_handle, daily_target, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     account_id, source_handle, daily_target, status, title_mode)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (norm_url, tiktok_user, vpn_region.upper(), profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-          account_id, source_handle, daily_target, status.upper()))
+          account_id, source_handle, daily_target, status.upper(), norm_title_mode))
     conn.commit()
     conn.close()
 
@@ -304,7 +314,7 @@ def update_channel_details(channel_id: int, data: dict):
     conn = sqlite3.connect(DB_PATH)
     fields = []
     vals = []
-    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "post_to_tiktok", "post_to_youtube"]:
+    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "title_mode", "post_to_tiktok", "post_to_youtube"]:
         if k in data:
             fields.append(f"{k} = ?")
             vals.append(data[k])
@@ -365,6 +375,7 @@ def get_all_channels_kpi_summary(target_date: str = None) -> dict:
             "profile_name": ch.get("profile_name", ""),
             "vpn_region": ch.get("vpn_region", "VN"),
             "status": ch_status,
+            "title_mode": (ch.get("title_mode") or "ai_rewrite").lower(),
             "daily_target": daily_target,
             "posted": posted,
             "missing": max(0, daily_target - posted)
@@ -386,145 +397,280 @@ def get_all_channels_kpi_summary(target_date: str = None) -> dict:
         "total_missing": total_missing_videos
     }
 
-# ================= 2. FFMPEG 4K & VIDEO PROCESSING =================
-def edit_and_upscale_4k(raw_path: str, output_path: str) -> dict:
-    """
-    Cắt tối đa 59s, zoom nhẹ 1.03x để đổi mã băm khung hình, 
-    upscale lên 2160x3840 (4K dọc) 30fps, xóa sạch metadata gốc.
-    """
-    vf_filter = (
-        "scale=2160:3840:force_original_aspect_ratio=increase:flags=lanczos,"
-        "crop=2160:3840,unsharp=3:3:0.8:3:3:0.0,eq=contrast=1.02:saturation=1.04,fps=30"
-    )
-    af_filter = "asetrate=44100*1.03,aresample=44100,atempo=0.9708"
-    encoder_args = detect_best_video_encoder()
+# ================= 2. FFMPEG 4K & VIDEO REMIX ENGINE =================
+def format_actual_quality_display(w: int, h: int, fps: float = 0) -> str:
+    """Định dạng tên chất lượng thực tế của video (4K, 2K, 1080p60, 1080p, 720p60, 720p)."""
+    w = int(w or 0)
+    h = int(h or 0)
+    fps_int = int(round(float(fps or 0)))
+    min_dim = min(w, h)
+    fps_str = f" {fps_int}fps" if fps_int > 0 else ""
 
-    cmd = [
-        FFMPEG_BIN, "-y", "-i", raw_path, "-t", "59",
-        "-vf", vf_filter, "-af", af_filter,
-        *encoder_args,
-        "-c:a", "aac", "-b:a", "192k", "-map_metadata", "-1",
-        output_path
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, **get_subprocess_kwargs())
+    if min_dim >= 2100:
+        return f"4K Ultra HD ({w}x{h}{fps_str})"
+    elif min_dim >= 1400:
+        return f"2K QHD ({w}x{h}{fps_str})"
+    elif min_dim >= 1070:
+        if fps_int >= 50:
+            return f"1080p60 Full HD ({w}x{h}{fps_str})"
+        return f"1080p Full HD ({w}x{h}{fps_str})"
+    elif min_dim >= 710:
+        if fps_int >= 50:
+            return f"720p60 HD ({w}x{h}{fps_str})"
+        return f"720p HD ({w}x{h}{fps_str})"
+    elif min_dim >= 470:
+        return f"480p SD ({w}x{h}{fps_str})"
+    elif min_dim > 0:
+        return f"{min_dim}p ({w}x{h}{fps_str})"
+    return "Không xác định"
 
-    # Đo lại bằng ffprobe
-    probe_cmd = [
-        FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate:format=duration",
-        "-of", "json", output_path
-    ]
+
+def get_best_format_metrics(formats: list) -> tuple[bool, int, int, int, float, str]:
+    """
+    Phân tích toàn bộ danh sách formats của yt-dlp để tìm ra luồng video có chất lượng cao nhất:
+    Ưu tiên: Độ phân giải (4K > 2K > 1080p > 720p) -> FPS (60fps > 30fps) -> Bitrate.
+    Trả về: (is_qualified, best_w, best_h, best_fps, best_tbr, quality_label)
+    """
+    if not formats:
+        return False, 0, 0, 0, 0.0, "Không có format video"
+
+    max_min_dim = 0
+    max_max_dim = 0
+    best_w = 0
+    best_h = 0
+    best_fps = 0
+    best_tbr = 0.0
+
+    for f in formats:
+        vcodec = f.get("vcodec")
+        if not vcodec or vcodec == "none":
+            continue
+        w = int(f.get("width") or 0)
+        h = int(f.get("height") or 0)
+        fps = float(f.get("fps") or 0)
+        tbr = float(f.get("vbr") or f.get("tbr") or 0.0)
+        min_dim = min(w, h)
+        max_dim = max(w, h)
+        cand_key = (min_dim, max_dim, fps, tbr)
+        best_key = (max_min_dim, max_max_dim, best_fps, best_tbr)
+        if cand_key > best_key:
+            max_min_dim = min_dim
+            max_max_dim = max_dim
+            best_w = w
+            best_h = h
+            best_fps = fps
+            best_tbr = tbr
+
+    is_qualified = (max_min_dim >= 710)
+    fps_int = int(round(best_fps)) if best_fps else 0
+    quality_label = format_actual_quality_display(best_w, best_h, fps_int)
+    return is_qualified, best_w, best_h, fps_int, best_tbr, quality_label
+
+
+def verify_downloaded_file_quality(file_path: str, return_fps: bool = False):
+    """Sử dụng ffprobe để kiểm tra kích thước và khung hình thực tế của tệp video sau khi tải về."""
+    if not os.path.exists(file_path):
+        return (False, 0, 0, "File không tồn tại", 0) if return_fps else (False, 0, 0, "File không tồn tại")
     try:
-        res = subprocess.run(probe_cmd, capture_output=True, text=True, check=True, **get_subprocess_kwargs())
-        probe_data = json.loads(res.stdout)
-        stream = probe_data["streams"][0]
-        width = stream.get("width", 2160)
-        height = stream.get("height", 3840)
-        fps_parts = stream.get("r_frame_rate", "30/1").split("/")
-        fps_denom = int(fps_parts[1]) if len(fps_parts) > 1 and int(fps_parts[1]) != 0 else 1
-        fps = round(int(fps_parts[0]) / fps_denom)
-        duration = round(float(probe_data.get("format", {}).get("duration", 59.0)), 1)
-        res_str = f"4K Ultra HD ({width}x{height} {fps}fps)"
-    except Exception:
-        res_str = "4K Ultra HD (2160x3840 30fps)"
-        duration = 59.0
+        cmd = [
+            FFPROBE_BIN, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "json", file_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, **get_subprocess_kwargs())
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            return (False, 0, 0, "Không tìm thấy luồng video", 0) if return_fps else (False, 0, 0, "Không tìm thấy luồng video")
+        w = int(streams[0].get("width", 0))
+        h = int(streams[0].get("height", 0))
+        fps_raw = str(streams[0].get("r_frame_rate", ""))
+        fps = 0
+        if "/" in fps_raw:
+            try:
+                num, den = fps_raw.split("/")
+                fps = round(float(num) / float(den)) if float(den) > 0 else 0
+            except Exception:
+                pass
 
+        min_dim = min(w, h)
+        is_ok = (min_dim >= 710)
+        actual_qual_str = format_actual_quality_display(w, h, fps)
+        label = actual_qual_str if is_ok else f"{actual_qual_str} (Kém chất lượng < 720p)"
+        if return_fps:
+            return is_ok, w, h, label, fps
+        return is_ok, w, h, label
+    except Exception as e:
+        err_lbl = f"Lỗi xác thực chất lượng qua ffprobe: {e}"
+        if return_fps:
+            return False, 0, 0, err_lbl, 0
+        return False, 0, 0, err_lbl
+
+
+def edit_and_upscale_4k(raw_path: str, output_path: str, log_callback=None) -> dict:
+    """
+    Video Remix Engine (FFmpeg Pipeline):
+    1. Zoom nhẹ 1.03x + crop trung tâm để đổi toàn bộ tọa độ pixel và mã băm hash frame.
+    2. Bộ lọc unsharp (làm nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
+    3. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x để lách Content ID nhưng giữ nguyên độ dài.
+    4. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1).
+    5. Hỗ trợ toàn bộ độ dài video (không cắt giới hạn 59s).
+    """
+    rendered_path = render_anti_copyright_video(
+        input_path=raw_path,
+        output_path=output_path,
+        zoom_ratio=1.03,
+        enable_audio_mod=True,
+        log_callback=log_callback
+    )
+
+    metrics = probe_video_metrics(rendered_path)
     return {
-        "resolution_str": res_str,
-        "duration": duration
+        "resolution_str": metrics.get("quality_str", "Full HD (1080x1920)"),
+        "duration": metrics.get("duration", 59.0),
+        "file_path": rendered_path
     }
 
-def remedy_audio_fast(video_4k_path: str, remedied_output_path: str) -> str:
+
+def remedy_audio_fast(video_4k_path: str, remedied_output_path: str, log_callback=None) -> str:
     """
     Cứu hộ âm thanh tức thì khi Content Check Lite báo lỗi bản quyền:
-    Giữ nguyên video 4K (-c:v copy), lọc bỏ dải tần âm thanh gốc và mix nhạc nền sạch ./safe_bgm.
+    Hòa trộn 15% âm hiện trường gốc + 85% nhạc nền an toàn từ safe_bgm (hoặc equalizer chống bản quyền).
     """
-    safe_bgm_dir = os.path.join(BASE_DIR, "safe_bgm")
-    bgm_files = [
-        os.path.join(safe_bgm_dir, f) for f in os.listdir(safe_bgm_dir)
-        if f.lower().endswith((".mp3", ".wav", ".m4a"))
-    ] if os.path.exists(safe_bgm_dir) else []
+    return remedy_audio_with_bgm(video_4k_path, remedied_output_path, log_callback=log_callback)
 
-    if bgm_files:
-        chosen_bgm = random.choice(bgm_files)
-        filter_complex = (
-            "[0:a]highpass=f=300,lowpass=f=2500,volume=0.15[orig];"
-            "[1:a]volume=0.85[bgm];"
-            "[orig][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
-        cmd = [
-            FFMPEG_BIN, "-y", "-i", video_4k_path, "-stream_loop", "-1", "-i", chosen_bgm,
-            "-filter_complex", filter_complex, "-map", "0:v:0", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", remedied_output_path
-        ]
-    else:
-        af_heavy = "asetrate=44100*1.08,aresample=44100,atempo=0.9259,aecho=0.8:0.88:15:0.2,equalizer=f=1000:width_type=h:width=200:g=-5"
-        cmd = [
-            FFMPEG_BIN, "-y", "-i", video_4k_path, "-af", af_heavy,
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", remedied_output_path
-        ]
 
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, **get_subprocess_kwargs())
-    return remedied_output_path
+def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_callback=None) -> dict | None:
+    """
+    Quét và tải video Shorts mới nhất chưa từng xử lý:
+    - Bật extractor_args tránh SABR 360p của YouTube.
+    - Chốt chặn bảo vệ chất lượng HD 720p/1080p: nếu video mới đăng (< 30 phút) và đang chờ encode HD,
+      hệ thống sẽ CHỜ YouTube hoàn tất encode bản 1080p chứ không vội tải bản 360p mờ.
+    - Tải bản chất lượng cao nhất (4K > 2K > 1080p60 > 1080p > 720p60 > 720p).
+    - Đo đạc thực tế bằng ffprobe.
+    """
+    def _log(msg):
+        if log_callback:
+            try: log_callback(msg)
+            except Exception: pass
+        else:
+            print(f"[Fetch Shorts]: {msg}")
 
-def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10) -> dict | None:
-    """Quét và tải video Shorts mới nhất chưa từng được xử lý (thời lượng chuẩn ≤ 59s)."""
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
     node_bin = shutil.which("node")
     js_runtimes = {"node": {}} if node_bin else {}
+
+    common_extractor_args = {"youtube": {"player_client": ["default", "web_embedded"]}}
+
     ydl_info_opts = {
-        'extract_flat': True,
-        'playlist_items': f'1-{max_lookback}',
-        'quiet': True,
-        'js_runtimes': js_runtimes
+        "extract_flat": True,
+        "playlist_items": f"1-{max_lookback}",
+        "quiet": True,
+        "js_runtimes": js_runtimes,
+        "extractor_args": common_extractor_args
     }
+
     with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
         try:
             info = ydl.extract_info(channel_shorts_url, download=False)
         except Exception as e:
-            print(f"[yt-dlp error]: {e}")
+            _log(f"❌ [yt-dlp error]: {e}")
             return None
 
-        if not info or 'entries' not in info or not info['entries']:
+        if not info or "entries" not in info or not info["entries"]:
             return None
 
-        target_id = None
-        for entry in info['entries']:
+        candidate_entry = None
+        for entry in info["entries"]:
             if not entry:
                 continue
-            v_id = entry.get('id')
+            v_id = entry.get("id")
             if not v_id or is_video_processed(v_id):
                 continue
-            dur = entry.get('duration')
-            if dur and dur > 65:
+            dur = entry.get("duration")
+            # Hỗ trợ video TikTok Studio lên tới 10 phút (600s)
+            if dur and dur > 600:
                 continue
-            target_id = v_id
+            candidate_entry = entry
             break
 
-        if not target_id:
+        if not candidate_entry:
             return None
 
+        target_id = candidate_entry.get("id")
         video_url = f"https://www.youtube.com/shorts/{target_id}"
 
-    raw_path = os.path.join(dl_dir, f"{target_id}_raw.mp4")
-    ydl_dl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': raw_path,
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'js_runtimes': js_runtimes
+    # Lấy thông tin format chi tiết để kiểm định chất lượng 1080p/720p trước khi tải
+    _log(f"🔍 Kiểm tra chất lượng formats trên YouTube cho video [{target_id}]...")
+    ydl_detail_opts = {
+        "quiet": True,
+        "js_runtimes": js_runtimes,
+        "extractor_args": common_extractor_args
     }
+    with yt_dlp.YoutubeDL(ydl_detail_opts) as ydl:
+        try:
+            full_info = ydl.extract_info(video_url, download=False)
+        except Exception as e:
+            _log(f"⚠️ Không thể lấy format video {video_url}: {e}")
+            return None
+
+        formats = full_info.get("formats", [])
+        is_hd, best_w, best_h, best_fps, best_tbr, qual_label = get_best_format_metrics(formats)
+
+        now_ts = int(time.time())
+        vid_ts = full_info.get("timestamp") or full_info.get("release_timestamp") or 0
+        age_minutes = (now_ts - vid_ts) / 60 if vid_ts else 0
+
+        # Chốt chặn chất lượng: Nếu video mới tải lên (< 30 phút) mà chưa có bản HD 720p/1080p -> Chờ YouTube encode
+        if not is_hd:
+            if vid_ts and age_minutes > 30:
+                _log(f"⛔ [BỎ QUA - CHẤT LƯỢNG KÉM < 720p] Video \"{full_info.get('title')}\" chỉ có {qual_label} sau hơn 30 phút. Bỏ qua.")
+            else:
+                _log(f"⏳ [CHỜ XỬ LÝ HD] Video mới nhất \"{full_info.get('title')}\" hiện mới có {qual_label}. Đang chờ YouTube encode xong bản HD 1080p/720p...")
+            return None
+
+        _log(f"🎯 [CHẤT LƯỢNG ĐẠT CHUẨN] Phát hiện bản {qual_label} cho video: \"{full_info.get('title')}\"")
+
+    # Tiến hành tải luồng video chất lượng cao nhất
+    raw_path = os.path.join(dl_dir, f"{target_id}_raw.mp4")
+    target_min_dim = min(best_w, best_h) if (best_w and best_h) else 1080
+    required_tier_dim = 1080 if target_min_dim >= 1070 else 720
+
+    ydl_dl_opts = {
+        "format": (
+            f"bestvideo[width>={required_tier_dim}][height>={required_tier_dim}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[width>={required_tier_dim}][height>={required_tier_dim}]+bestaudio/"
+            f"bestvideo[width>=710][height>=710][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ),
+        "outtmpl": raw_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "js_runtimes": js_runtimes,
+        "extractor_args": common_extractor_args
+    }
+
+    _log(f"📥 Đang tải video chất lượng cao từ YouTube ({qual_label})...")
     with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl:
-        full_info = ydl.extract_info(video_url, download=True)
+        download_info = ydl.extract_info(video_url, download=True)
+        # Xác thực chất lượng file tải về qua ffprobe
+        is_ok, real_w, real_h, verified_qual, real_fps = verify_downloaded_file_quality(raw_path, return_fps=True)
+        _log(f"✅ Đã tải xong video! Đo đạc thực tế ffprobe: {verified_qual}")
+
         return {
             "video_id": target_id,
-            "title": full_info.get("title", "Shorts Video"),
-            "uploader": full_info.get("uploader", "YouTube Channel"),
+            "title": (download_info.get("title") or full_info.get("title") or "").strip(),
+            "description": (download_info.get("description") or full_info.get("description") or "").strip(),
+            "uploader": download_info.get("uploader", "YouTube Channel"),
             "url": video_url,
             "raw_path": raw_path,
-            "duration": full_info.get("duration", 59.0)
+            "duration": download_info.get("duration", full_info.get("duration", 59.0)),
+            "quality_str": verified_qual,
+            "is_1080": min(real_w, real_h) >= 1070
         }
+
 
 # ================= 3. CAMOUFOX BROWSER LAUNCHER =================
 def _prepare_camoufox_kwargs(profile_dir: str, proxy_server: str = "", os_type: str = "windows", screen: str = "1920x1080", locale: str = "", headless: bool = False) -> dict:
@@ -619,33 +765,284 @@ def dismiss_tiktok_popups(page, logger=None):
         except Exception:
             pass
 
-def wait_for_content_check(page, max_wait_seconds: int = 90) -> tuple[bool, str]:
+def toggle_auto_copyright_and_content_checks(page, log=None):
+    """
+    Tự động tìm và kích hoạt công tắc Content Check Lite trên TikTok Studio.
+    Đa chiến lược (cuộn trang, selector native, javascript fallback).
+    """
+    def _l(msg):
+        if log:
+            try: log(msg)
+            except Exception: pass
+
+    _l("🛡️ [Kiểm Duyệt Tự Động] Đang tìm và kích hoạt: 'Content Check Lite' (Bản quyền nội dung)...")
+    try:
+        page.evaluate("""() => {
+            const scrollContainers = Array.from(document.querySelectorAll('main, [class*="content"], [class*="upload-container"], [class*="scroll"], body, html'));
+            for (const c of scrollContainers) {
+                try { c.scrollTop = c.scrollHeight; } catch (e) {}
+            }
+            window.scrollTo(0, document.body.scrollHeight);
+        }""")
+    except Exception:
+        pass
+    time.sleep(1)
+
+    try:
+        sw_el = page.locator(
+            '[data-e2e="content-check-switch"] [role="switch"], '
+            'div[class*="content-check"] [role="switch"], '
+            'div[class*="copyright"] [role="switch"], '
+            'div[class*="content-check"] button[role="switch"]'
+        ).first
+        if sw_el.count() > 0 and sw_el.is_visible():
+            is_on = (sw_el.get_attribute('aria-checked') or '').lower() == 'true'
+            if is_on:
+                _l("✅ [Content Check Lite] Công tắc đã ở trạng thái BẬT từ trước.")
+                return True
+            else:
+                sw_el.click(force=True)
+                time.sleep(0.8)
+                _l("⚡ [Content Check Lite] Đã bấm BẬT công tắc thành công qua Playwright Native Click!")
+                return True
+    except Exception as e:
+        _l(f"Cảnh báo tìm switch Content Check: {e}")
+
+    try:
+        js_turn_on = """() => {
+            const contentKws = [
+                "content check (lite)", "content check lite", "content check", "content-check",
+                "kiểm tra nội dung (lite)", "kiểm tra nội dung", "kiểm duyệt nội dung", "checks", "kiểm tra"
+            ];
+            const allSwitches = Array.from(document.querySelectorAll('[role="switch"], input[type="checkbox"], div[class*="switch"], span[class*="switch"]'));
+            for (const sw of allSwitches) {
+                let p = sw;
+                for (let i = 0; i < 4 && p; i++) {
+                    const txt = (p.innerText || "").toLowerCase();
+                    if (contentKws.some(k => txt.includes(k))) {
+                        const isOn = sw.getAttribute('aria-checked') === 'true' || sw.checked === true || (sw.className && sw.className.includes('checked'));
+                        if (!isOn) {
+                            sw.click();
+                            return "turned_on";
+                        }
+                        return "already_on";
+                    }
+                    p = p.parentElement;
+                }
+            }
+            return "not_found";
+        }"""
+        status = page.evaluate(js_turn_on)
+        if status in ("turned_on", "already_on"):
+            _l(f"✅ [Content Check Lite] Trạng thái công tắc: {status}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def check_tiktok_content_check_lite_status(page) -> dict:
+    """
+    Quét và phân tích trạng thái của DUY NHẤT mục 'Content Check Lite' (Bản quyền nội dung nhanh).
+    Hỗ trợ đa ngôn ngữ và tìm kiếm xuyên suốt mọi frames.
+    Trả về: {"status": "GREEN"|"RED"|"CHECKING"|"UNKNOWN"|"NOT_FOUND", "detail": str}
+    """
+    js_eval = """() => {
+        function isInsideSidebarOrNav(el) {
+            if (!el) return false;
+            return el.closest('aside, nav, [class*="sidebar"], [class*="menu"], [class*="navigation"], [class*="navbar"], header, [class*="preview"]') !== null;
+        }
+
+        const contentKws = [
+            "content check (lite)", "content check lite", "content check", "content-check",
+            "comprobación de contenido (lite)", "comprobación de contenido", "revisión de contenido",
+            "verificación de contenido", "control de contenido",
+            "kiểm tra nội dung (lite)", "kiểm tra nội dung (bản lite)", "kiểm tra nội dung lite",
+            "kiểm tra nội dung nhanh", "nội dung nhanh", "kiểm tra nội dung", "kiểm duyệt nội dung nhanh",
+            "kiểm duyệt nội dung", "video pre-check", "quick check", "kiểm tra trước khi đăng"
+        ];
+
+        const redPhrases = [
+            "phát hiện vấn đề về bản quyền", "phát hiện vấn đề bản quyền",
+            "đã phát hiện vấn đề về bản quyền", "vi phạm bản quyền",
+            "phát hiện vi phạm", "vi phạm tiêu chuẩn", "vi phạm nội dung",
+            "copyright issue detected", "copyright issues detected",
+            "copyright infringement", "issues detected", "issues found",
+            "content issue", "problemas de derechos", "infracción",
+            "problemas detectados", "se han detectado problemas", "se detectaron problemas",
+            "bloqueado", "infringement", "violation detected"
+        ];
+
+        const greenPhrases = [
+            "không phát hiện vấn đề nào", "không phát hiện thấy vấn đề nào",
+            "không phát hiện vấn đề", "không có vấn đề", "no issues found",
+            "no issues detected", "no content issues", "no copyright issues",
+            "no se encontraron problemas", "no se han detectado problemas", "sin problemas",
+            "passed", "hợp lệ", "safe", "an toàn", "aprobado", "correcto", "válido", "no issues"
+        ];
+
+        const pendingPhrases = [
+            "checking", "checking...", "đang kiểm tra", "quá trình này sẽ mất", "sẽ mất khoảng",
+            "comprobando", "comprobando...", "scanning", "cargando", "este proceso tardará",
+            "tardará unos", "in progress", "đang quét"
+        ];
+
+        // 0. Nhận diện trực tiếp theo cấu trúc DOM TikTok Studio mới nhất (.status-wrapper .status-result[data-show="true"])
+        const showItem = document.querySelector('.status-wrapper .status-result[data-show="true"]');
+        if (showItem) {
+            const cls = (showItem.className || "").toLowerCase();
+            const txt = (showItem.innerText || "").toLowerCase();
+            if (cls.includes('status-success') || txt.includes('no issues found') || txt.includes('không phát hiện')) {
+                return { status: "GREEN", detail: "Content Check Lite: Không phát hiện vi phạm (Đạt chuẩn an toàn)" };
+            }
+            if (cls.includes('status-error') || cls.includes('status-warn') || txt.includes('restricted') || txt.includes('vi phạm')) {
+                return { status: "RED", detail: "Content Check Lite: Phát hiện cảnh báo vi phạm nội dung" };
+            }
+            if (cls.includes('status-checking') || txt.includes('checking in progress') || txt.includes('đang kiểm tra')) {
+                return { status: "CHECKING", detail: "Content Check Lite đang quét bản quyền..." };
+            }
+        }
+
+        // 1. Quét tìm card/switch Content Check Lite
+        const allSwitches = Array.from(document.querySelectorAll(
+            'button[role="switch"], div[role="switch"], [role="switch"], input[type="checkbox"], div[class*="switch"], span[class*="switch"]'
+        )).filter(sw => !isInsideSidebarOrNav(sw));
+
+        let contentSwitch = null;
+        let contentCard = null;
+
+        for (const sw of allSwitches) {
+            let curr = sw;
+            for (let i = 0; i < 5 && curr; i++) {
+                if (isInsideSidebarOrNav(curr)) break;
+                const txt = (curr.innerText || "").toLowerCase();
+                if (contentKws.some(k => txt.includes(k))) {
+                    contentSwitch = sw;
+                    contentCard = curr;
+                    break;
+                }
+                curr = curr.parentElement;
+            }
+            if (contentCard) break;
+        }
+
+        if (!contentCard) {
+            const formScope = document.querySelector('form, [class*="upload"], main') || document.body;
+            const fullTxt = (formScope.innerText || "").toLowerCase();
+            for (const g of greenPhrases) {
+                if (fullTxt.includes(g)) return { status: "GREEN", detail: g };
+            }
+            for (const r of redPhrases) {
+                if (fullTxt.includes(r)) return { status: "RED", detail: r };
+            }
+            for (const p of pendingPhrases) {
+                if (fullTxt.includes(p)) return { status: "CHECKING", detail: p };
+            }
+            return { status: "NOT_FOUND", detail: "Không tìm thấy hàng Content Check Lite" };
+        }
+
+        let checkScopeText = (contentCard.innerText || "").toLowerCase();
+
+        for (const phrase of redPhrases) {
+            if (checkScopeText.includes(phrase)) {
+                return { status: "RED", detail: phrase };
+            }
+        }
+
+        // Kiểm tra icon màu đỏ cảnh báo
+        const redEls = Array.from(contentCard.querySelectorAll('svg, path, span, div')).filter(el => {
+            const cs = window.getComputedStyle(el);
+            const c = cs.color || "";
+            const f = el.getAttribute('fill') || cs.fill || "";
+            const isRed = (v) => v.includes('254, 44, 85') || v.includes('239, 68, 68') || v.includes('220, 38, 38') || v.includes('#fe2c55') || v.includes('#ef4444');
+            return isRed(c) || isRed(f);
+        });
+        if (redEls.length > 0) {
+            return { status: "RED", detail: "Phát hiện màu đỏ cảnh báo vi phạm" };
+        }
+
+        for (const phrase of greenPhrases) {
+            if (checkScopeText.includes(phrase)) {
+                return { status: "GREEN", detail: phrase };
+            }
+        }
+
+        // Kiểm tra icon màu xanh an toàn
+        const greenEls = Array.from(contentCard.querySelectorAll('svg, path, span, div')).filter(el => {
+            const cs = window.getComputedStyle(el);
+            const c = cs.color || "";
+            const f = el.getAttribute('fill') || cs.fill || "";
+            const isGreen = (v) => v.includes('0, 181, 120') || v.includes('34, 197, 94') || v.includes('16, 185, 129') || v.includes('#00b578') || v.includes('#22c55e') || v.includes('#10b981');
+            return isGreen(c) || isGreen(f);
+        });
+        if (greenEls.length > 0) {
+            return { status: "GREEN", detail: "Phát hiện dấu tích xanh an toàn" };
+        }
+
+        for (const phrase of pendingPhrases) {
+            if (checkScopeText.includes(phrase)) {
+                return { status: "CHECKING", detail: phrase };
+            }
+        }
+
+        return { status: "CHECKING", detail: "Content Check Lite đang quét..." };
+    }"""
+
+    containers = [page]
+    try:
+        if hasattr(page, 'frames') and callable(getattr(page, 'frames', None)):
+            containers += list(page.frames())
+        elif hasattr(page, 'frames') and isinstance(page.frames, list):
+            containers += list(page.frames)
+    except Exception:
+        pass
+
+    for container in containers:
+        try:
+            res = container.evaluate(js_eval)
+            if res and res.get("status") in ("GREEN", "RED", "CHECKING"):
+                return res
+            if res and res.get("status") == "UNKNOWN":
+                return res
+        except Exception:
+            continue
+
+    return {"status": "NOT_FOUND", "detail": "Không tìm thấy hàng Content Check Lite"}
+
+
+def wait_for_content_check(page, max_wait_seconds: int = 90, log_callback=None) -> tuple[bool, str]:
     """
     Theo dõi kết quả Content Check Lite trên TikTok Studio.
-    Trả về (is_green, status_text)
+    Polling liên tục và chỉ cho phép Post khi kết quả là GREEN.
     """
+    def _log(msg):
+        if log_callback:
+            try: log_callback(msg)
+            except Exception: pass
+
     polls = max(1, max_wait_seconds // 3)
+    last_detail = ""
     for p_idx in range(polls):
         time.sleep(3)
         if p_idx % 3 == 0:
             dismiss_tiktok_popups(page)
-        try:
-            body_text = page.inner_text("body")
-        except Exception:
-            break
 
-        if any(m.lower() in body_text.lower() for m in [
-            "no issues found", "không phát hiện vấn đề", "sin problemas detectados", "aucun problème détecté", "keine probleme gefunden"
-        ]):
-            return True, "Content Check Lite: HỢP LỆ (XANH)"
+        res = check_tiktok_content_check_lite_status(page)
+        status = res.get("status")
+        detail = res.get("detail", "")
 
-        if any(m.lower() in body_text.lower() for m in [
-            "issues found", "issue found", "phát hiện vấn đề", "copyright", "bản quyền", "unoriginal", "derechos de autor"
-        ]):
-            if not any(c.lower() in body_text.lower() for c in ["checking", "đang kiểm tra", "comprobando", "vérification"]):
-                return False, "Content Check Lite: CẢNH BÁO BẢN QUYỀN (ĐỎ/VÀNG)"
+        if detail != last_detail and status != "NOT_FOUND":
+            last_detail = detail
+            _log(f"🔍 [Content Check] ({p_idx*3}s/{max_wait_seconds}s) Trạng thái: {status} -> {detail}")
 
-    return True, "Content Check Lite: HỢP LỆ (XANH)"
+        if status == "GREEN":
+            return True, f"Content Check Lite: HỢP LỆ (XANH) - {detail}"
+        elif status == "RED":
+            return False, f"Content Check Lite: CẢNH BÁO VI PHẠM (ĐỎ) - {detail}"
+        elif status == "CHECKING":
+            continue
+
+    return True, "Content Check Lite: HỢP LỆ (Hết thời gian quét - Không có vi phạm)"
 
 # ================= 4. TIKTOK STUDIO AUTOMATION (CAMOUFOX) =================
 def upload_to_tiktok_with_fallback(
@@ -660,7 +1057,7 @@ def upload_to_tiktok_with_fallback(
 ) -> dict:
     """
     Tự động hóa đăng bài TikTok Studio qua Camoufox Antidetect với Fallback 2 tầng:
-    - Tầng 1: Nếu dính bản quyền âm thanh -> Gọi remedy_audio_fast và Thay thế file (Replace).
+    - Tầng 1: Kích hoạt Content Check Lite -> Nếu dính cảnh báo âm thanh -> Gọi remedy_audio_fast và Thay thế file (Replace).
     - Tầng 2: Nếu quét lại vẫn dính cảnh báo -> Lưu nháp (Save to drafts) bảo vệ an toàn cho kênh.
     """
     def _log(msg):
@@ -733,17 +1130,18 @@ def upload_to_tiktok_with_fallback(
                     page.keyboard.type(caption, delay=20)
                 time.sleep(1)
 
-                # 3. Đợi kết quả Content Check Lite lần 1
+                # 3. Kích hoạt công tắc Content Check Lite & Theo dõi kết quả
+                toggle_auto_copyright_and_content_checks(page, _log)
                 _log("⏳ Đang theo dõi quét bản quyền Content Check Lite (tối đa 90s)...")
-                is_green, check_status = wait_for_content_check(page)
+                is_green, check_status = wait_for_content_check(page, max_wait_seconds=90, log_callback=_log)
                 _log(f"🔎 Kết quả kiểm tra lần 1: {check_status}")
 
                 # 4. KÍCH HOẠT TẦNG 1: SỬA ÂM THANH & THAY THẾ (REPLACE)
                 if not is_green:
-                    _log("🚨 Phát hiện cảnh báo bản quyền âm thanh! Đang kích hoạt cứu hộ tầng 1 (Remedy Audio Fast)...")
+                    _log("🚨 Phát hiện cảnh báo bản quyền âm thanh! Đang kích hoạt cứu hộ tầng 1 (Remedy Audio with Safe BGM)...")
                     remedied_path = video_4k_path.replace(".mp4", "_remedy.mp4")
                     try:
-                        remedy_audio_fast(video_4k_path, remedied_path)
+                        remedy_audio_fast(video_4k_path, remedied_path, log_callback=_log)
                     except Exception as e_rem:
                         _log(f"⚠️ Lỗi xử lý âm thanh remedy: {e_rem}")
                         remedied_path = video_4k_path
@@ -816,11 +1214,13 @@ def upload_to_tiktok_with_fallback(
                             page.keyboard.type(caption, delay=20)
                         time.sleep(1)
 
+                    toggle_auto_copyright_and_content_checks(page, _log)
                     _log("🔄 Đã nạp video đã sửa âm thanh, đang đợi Content Check Lite quét lại...")
-                    is_green, check_status = wait_for_content_check(page)
+                    is_green, check_status = wait_for_content_check(page, max_wait_seconds=90, log_callback=_log)
                     if is_green:
                         check_status = "Content Check Lite: HỢP LỆ (XANH - ĐÃ FIX AUDIO)"
                     _log(f"🔎 Kết quả kiểm tra lần 2: {check_status}")
+
 
                 # 5. QUYẾT ĐỊNH ĐĂNG HOẶC LƯU NHÁP (TẦNG 2)
                 dismiss_tiktok_popups(page, _log)
@@ -1149,16 +1549,31 @@ def process_and_upload_local_video(
         raise FileNotFoundError(f"Không tìm thấy file video: {video_path}")
 
     video_id = f"local_{datetime.now().strftime('%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
-    clean_title = title.strip().replace("\n", " ")
-    if not clean_title:
-        clean_title = clean_filename_to_title(video_path)
+    clean_title = (title or "").strip().replace("\n", " ")
+    clean_desc = (description or "").strip()
 
     # Chuẩn hóa Hashtags
     if isinstance(hashtags, list):
         tags_list = [t.lower() if t.startswith("#") else f"#{t.lower()}" for t in hashtags]
         tags_str = " ".join(tags_list)
     else:
-        tags_str = hashtags.strip()
+        tags_str = (hashtags or "").strip()
+
+    # Nếu thiếu tiêu đề hoặc mô tả gốc -> tự động gọi AI viết bù phần thiếu
+    if not clean_title or not clean_desc:
+        _log("🤖 Phát hiện thiếu tiêu đề hoặc mô tả -> tự động gọi AI viết bù phần còn thiếu...")
+        auto_meta = build_caption_metadata(
+            original_title=clean_title,
+            target_region=vpn_region,
+            title_mode="keep_original",
+            original_description=clean_desc,
+            existing_hashtags=tags_str,
+            fallback_topic=clean_filename_to_title(video_path),
+        )
+        clean_title = auto_meta.get("title", clean_title) or clean_filename_to_title(video_path)
+        clean_desc = auto_meta.get("description", clean_desc)
+        if not tags_str and auto_meta.get("hashtags"):
+            tags_str = " ".join(auto_meta["hashtags"])
 
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
@@ -1193,7 +1608,12 @@ def process_and_upload_local_video(
             duration = 30.0
 
     profile_name = profile_data.get("name", "Unknown Profile")
-    profile_dir = os.path.abspath(os.path.join(BASE_DIR, profile_data.get("path", "")))
+    raw_p_path = (profile_data.get("path") or "").strip()
+    if raw_p_path:
+        profile_dir = os.path.abspath(raw_p_path if os.path.isabs(raw_p_path) else os.path.join(BASE_DIR, raw_p_path))
+    else:
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in profile_name)
+        profile_dir = os.path.abspath(os.path.join(BASE_DIR, "profiles", safe_name))
     proxy_server = profile_data.get("proxy", "")
     os_type = profile_data.get("os", "windows")
     screen = profile_data.get("screen", "1920x1080")
@@ -1201,15 +1621,15 @@ def process_and_upload_local_video(
 
     # Chuẩn bị Caption & Hashtags
     tt_caption_parts = [clean_title]
-    if description.strip():
-        tt_caption_parts.append(description.strip())
+    if clean_desc:
+        tt_caption_parts.append(clean_desc)
     if tags_str:
         tt_caption_parts.append(tags_str)
     tiktok_caption = "\n\n".join(tt_caption_parts)
     if len(tiktok_caption) > 2100:
         tiktok_caption = tiktok_caption[:2050] + "..."
 
-    yt_description = f"{description.strip()}\n\n{tags_str}".strip() if description.strip() else tags_str
+    yt_description = f"{clean_desc}\n\n{tags_str}".strip() if clean_desc else tags_str
 
     # 2. Đăng lên TikTok Studio
     tt_action = "SKIPPED"
@@ -1356,21 +1776,31 @@ def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> 
         return {"success": False, "error": "Kênh chưa cấu hình link YouTube Shorts"}
 
     _log(f"🔎 Đang quét video mới nhất từ: {yt_url}...")
-    item = fetch_latest_short(yt_url)
+    item = fetch_latest_short(yt_url, log_callback=_log)
     if not item:
-        _log(f"⚠️ Không tìm thấy video Shorts mới (thời lượng ≤ 59s và chưa xử lý) từ {yt_url}")
+        _log(f"⚠️ Chưa có video Shorts mới đạt chuẩn 1080p/720p hoặc video đang chờ YouTube xử lý từ {yt_url}")
         return {"success": False, "error": "Không có video mới phù hợp"}
 
-    _log(f"✨ Phát hiện video Shorts: '{item['title']}'. Tiến hành tải và xử lý...")
+    _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Tiến hành render lách bản quyền...")
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
-    out_4k = os.path.join(dl_dir, f"{item['video_id']}_4k.mp4")
-    stats = edit_and_upscale_4k(item["raw_path"], out_4k)
+    out_remix = os.path.join(dl_dir, f"{item['video_id']}_remix.mp4")
+    stats = edit_and_upscale_4k(item["raw_path"], out_remix, log_callback=_log)
+    final_video_path = stats.get("file_path", out_remix)
 
-    # Sinh caption & hashtag theo thị trường đích
+
+    # Sinh caption & hashtag theo chế độ kênh (Giữ gốc / AI viết lại, tự dùng AI nếu thiếu tiêu đề hoặc mô tả gốc)
     vpn_region = ch.get("vpn_region", "VN")
-    seo_meta = generate_seo_metadata(item["title"], target_region=vpn_region, niche_hint=ch.get("niche", ""))
-    title = seo_meta.get("title", item["title"])
+    title_mode = (ch.get("title_mode") or "ai_rewrite").lower()
+    _log(f"📝 Chế độ tiêu đề: {'Giữ tiêu đề/mô tả gốc (AI bù nếu thiếu)' if title_mode == 'keep_original' else 'AI viết lại theo vùng SEO'} ({vpn_region})")
+    seo_meta = build_caption_metadata(
+        item.get("title", ""),
+        target_region=vpn_region,
+        niche_hint=ch.get("niche", ""),
+        title_mode=title_mode,
+        original_description=item.get("description", ""),
+    )
+    title = seo_meta.get("title", item.get("title", ""))
     desc = seo_meta.get("description", "")
     tags = seo_meta.get("hashtags", [])
 
@@ -1384,7 +1814,7 @@ def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> 
     }
 
     res = process_and_upload_local_video(
-        video_path=out_4k,
+        video_path=final_video_path,
         title=title,
         description=desc,
         hashtags=tags,
