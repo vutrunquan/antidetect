@@ -22,9 +22,12 @@ import requests
 
 from profile_manager import ProfileManager
 from browser_runner import parse_proxy
-from platform_utils import BASE_DIR, load_config, save_config
+from platform_utils import BASE_DIR, load_config, save_config, set_keep_awake
 from ai_seo_helper import generate_seo_metadata, clean_filename_to_title
 import post_manager
+import video_remix_engine
+import channel_auditor
+import series_manager
 
 class Api:
     def __init__(self):
@@ -388,6 +391,10 @@ class Api:
 
         def _worker():
             try:
+                if profile_id and profile_id in self.running_processes:
+                    self.log(f"⚠️ Profile [{profile_data.get('name')}] đang mở thủ công. Tự động đóng để nhường quyền cho bot đăng bài...")
+                    self.stop_profile(profile_id)
+                    time.sleep(1)
                 res = post_manager.process_and_upload_local_video(
                     video_path=video_path,
                     title=title,
@@ -444,6 +451,12 @@ class Api:
 
         def _task():
             self.log(f"⏳ Đang phát hành bản nháp video: {rec.get('shorts_title')}...")
+            p_dir = rec.get("profile_dir", "")
+            p_id = os.path.basename(p_dir) if p_dir else ""
+            if p_id and p_id in self.running_processes:
+                self.log(f"⚠️ Profile [{rec.get('profile_name')}] đang mở thủ công. Tự động đóng để phát hành nháp...")
+                self.stop_profile(p_id)
+                time.sleep(1)
             ok = post_manager.force_publish_draft(rec, log_callback=self.log)
             if ok:
                 self.log("✅ Đã phát hành bản nháp thành công!")
@@ -499,12 +512,54 @@ class Api:
                 source_handle=data.get("source_handle", "").strip(),
                 daily_target=int(data.get("daily_target", 2)),
                 status=data.get("status", "ACTIVE"),
-                title_mode=data.get("title_mode", "ai_rewrite")
+                title_mode=data.get("title_mode", "ai_rewrite"),
+                order_mode=data.get("order_mode", "oldest_first"),
+                crop_mode=data.get("crop_mode", "blur_9_16"),
+                series_name=data.get("series_name", "").strip()
             )
             self.log(f"➕ Đã thêm kênh TikTok Beta: {data.get('youtube_shorts_url')}")
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    def get_crop_options(self):
+        try:
+            return video_remix_engine.get_crop_options()
+        except Exception as e:
+            return {"blur_9_16": "Thêm nền mờ 9:16 (Chuẩn TikTok Shorts)", "crop_9_16": "Cắt trung tâm 9:16", "original": "Giữ nguyên tỷ lệ gốc"}
+
+    def get_golden_hours_presets(self):
+        try:
+            return post_manager.get_golden_hours_presets()
+        except Exception:
+            return {}
+
+    def get_all_series(self, channel_id=None):
+        try:
+            cid = int(channel_id) if channel_id else None
+            return series_manager.get_all_series(channel_id=cid)
+        except Exception as e:
+            return []
+
+    def audit_channel(self, channel_id):
+        def _task():
+            self.log(f"🩺 Bắt đầu khám sức khỏe & Shadowban cho kênh #{channel_id}...")
+            res = channel_auditor.audit_channel_health(int(channel_id), log_callback=self.log)
+            if res.get("success"):
+                score = res.get("health_score", 0)
+                status = res.get("health_status", "UNKNOWN")
+                self.log(f"🩺 Khám kênh #{channel_id} hoàn tất! Điểm: {score}/100 - Trạng thái: {status}")
+            else:
+                self.log(f"❌ Khám kênh #{channel_id} thất bại: {res.get('error')}")
+
+        threading.Thread(target=_task, daemon=True).start()
+        return {"ok": True, "msg": "Đang mở trình duyệt kiểm tra video & khám kênh..."}
+
+    def set_keep_awake(self, enable=True):
+        res = set_keep_awake(bool(enable))
+        status_text = "BẬT (Không tắt màn hình/sleep)" if enable else "TẮT (Chế độ bình thường)"
+        self.log(f"⚡️ Chế độ Treo Máy Đêm: {status_text}")
+        return {"ok": True, "active": res}
 
     def toggle_channel_status(self, channel_id, new_status):
         try:
@@ -520,6 +575,16 @@ class Api:
             post_manager.update_channel_details(int(channel_id), {"title_mode": norm})
             label = "Giữ tiêu đề gốc" if norm == "keep_original" else "AI viết lại"
             self.log(f"📝 Kênh #{channel_id} chuyển chế độ tiêu đề sang: {label}")
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def toggle_channel_order_mode(self, channel_id, new_mode):
+        try:
+            norm = "newest_first" if str(new_mode).strip().lower() == "newest_first" else "oldest_first"
+            post_manager.update_channel_details(int(channel_id), {"order_mode": norm})
+            label = "Từ video mới nhất" if norm == "newest_first" else "Từ video cũ nhất"
+            self.log(f"⏳ Kênh #{channel_id} chuyển thứ tự lấy video sang: {label}")
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -543,6 +608,14 @@ class Api:
     def run_channel_now(self, channel_id):
         def _task():
             self.log(f"🚀 Kích hoạt chạy ngay cho kênh #{channel_id}...")
+            ch = post_manager.get_channel_by_id(int(channel_id))
+            if ch:
+                p_dir = ch.get("profile_dir", "")
+                p_id = os.path.basename(p_dir) if p_dir else ""
+                if p_id and p_id in self.running_processes:
+                    self.log(f"⚠️ Profile [{ch.get('profile_name')}] đang mở thủ công. Tự động đóng để nhường quyền cho bot đăng bài...")
+                    self.stop_profile(p_id)
+                    time.sleep(1)
             res = post_manager.run_single_channel_download_and_post(int(channel_id), log_callback=self.log)
             if res.get("success"):
                 self.log(f"✅ Kênh #{channel_id} hoàn tất lượt đăng video!")
@@ -551,6 +624,31 @@ class Api:
 
         threading.Thread(target=_task, daemon=True).start()
         return {"ok": True, "msg": "Đang xử lý quét và đăng video..."}
+
+    def run_channel_custom_video(self, channel_id, video_url):
+        def _task():
+            clean_url = str(video_url or "").strip()
+            self.log(f"🎯 Kích hoạt đăng VIDEO TÙY CHỌN cho kênh #{channel_id}: {clean_url}...")
+            ch = post_manager.get_channel_by_id(int(channel_id))
+            if ch:
+                p_dir = ch.get("profile_dir", "")
+                p_id = os.path.basename(p_dir) if p_dir else ""
+                if p_id and p_id in self.running_processes:
+                    self.log(f"⚠️ Profile [{ch.get('profile_name')}] đang mở thủ công. Tự động đóng để nhường quyền cho bot đăng bài...")
+                    self.stop_profile(p_id)
+                    time.sleep(1)
+            res = post_manager.run_single_channel_download_and_post(
+                channel_id=int(channel_id),
+                specific_video_url=clean_url,
+                log_callback=self.log
+            )
+            if res.get("success"):
+                self.log(f"✅ Video tùy chọn đã được xuất bản thành công lên TikTok cho kênh #{channel_id}!")
+            else:
+                self.log(f"❌ Đăng video tùy chọn thất bại: {res.get('error')}")
+
+        threading.Thread(target=_task, daemon=True).start()
+        return {"ok": True, "msg": "Đang bắt đầu xử lý và đăng video chỉ định..."}
 
     def execute_compensation(self, mode="bu1"):
         post_manager.execute_compensation(mode=mode, log_callback=self.log)

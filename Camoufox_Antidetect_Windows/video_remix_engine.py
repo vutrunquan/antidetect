@@ -59,9 +59,9 @@ def detect_best_video_encoder():
         candidates.append(("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-b:v", "18M"]))
     
     candidates.extend([
-        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20"]),
-        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast"]),
-        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed"])
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "6M", "-maxrate", "8M", "-bufsize", "12M"]),
+        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "6M"]),
+        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "6M"])
     ])
 
     for enc, args in candidates:
@@ -81,20 +81,42 @@ def detect_best_video_encoder():
     return _CACHED_BEST_ENCODER
 
 
+# Danh mục các tùy chọn cắt khung hình
+CROP_OPTIONS = [
+    {"id": "original", "name": "🎬 Giữ nguyên tỷ lệ gốc"},
+    {"id": "blur_9_16", "name": "📱 Dọc 9:16 - Nền Mờ Nghệ Thuật (Blur Background - Khuyên Dùng)"},
+    {"id": "crop_9_16", "name": "✂️ Dọc 9:16 - Cắt Giữa Tâm (Center Crop 1080x1920)"},
+    {"id": "crop_1_1", "name": "⏹️ Khung Vuông 1:1 (Square 1080x1080)"},
+    {"id": "crop_16_9", "name": "🖥️ Khung Ngang 16:9 (Landscape 1920x1080)"},
+]
+
+MOBILE_CAMERA_PRESETS = [
+    {"make": "Apple", "model": "iPhone 15 Pro Max", "encoder": "Apple QuickTime 17.2", "comment": "Mobile Camera Capture"},
+    {"make": "Apple", "model": "iPhone 14 Pro", "encoder": "Apple QuickTime 16.5", "comment": "Mobile Camera Capture"},
+    {"make": "Samsung", "model": "Galaxy S23 Ultra", "encoder": "Samsung Camera v13.1", "comment": "Mobile Camera Capture"},
+    {"make": "Apple", "model": "iPhone 13", "encoder": "Apple QuickTime 16.1", "comment": "Mobile Camera Capture"}
+]
+
+def get_crop_options():
+    return CROP_OPTIONS
+
 def render_anti_copyright_video(
     input_path: str,
     output_path: str = None,
     zoom_ratio: float = 1.03,
     enable_audio_mod: bool = True,
+    crop_mode: str = "original",
+    fake_mobile_camera: bool = True,
     log_callback=None
 ) -> str:
     """
     Xử lý video qua pipeline FFmpeg chuyên sâu:
     1. Zoom nhẹ (mặc định 1.03x) + crop trung tâm để thay đổi toàn bộ tọa độ pixel và mã băm hash frame.
-    2. Bộ lọc unsharp (làm sắc nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
-    3. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x mà tai người nghe tự nhiên, giữ nguyên độ dài.
-    4. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1).
-    5. HỖ TRỢ TOÀN BỘ ĐỘ DÀI: Tuyệt đối không cắt giới hạn 59s.
+    2. Chuyển đổi tỷ lệ khung hình linh hoạt (original, blur_9_16 nền mờ, crop_9_16, crop_1_1).
+    3. Bộ lọc unsharp (làm sắc nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
+    4. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x mà tai người nghe tự nhiên, giữ nguyên độ dài.
+    5. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1) và chèn Metadata Camera Điện Thoại Thật (iPhone 15 Pro Max/S23 Ultra) để lách quét 0-view.
+    6. HỖ TRỢ TOÀN BỘ ĐỘ DÀI: Tuyệt đối không cắt giới hạn 59s.
     """
     def log(msg):
         if log_callback:
@@ -115,33 +137,90 @@ def render_anti_copyright_video(
 
     log(f"🎬 Bắt đầu tối ưu lách bản quyền & mã băm cho video: {os.path.basename(input_path)}")
 
-    # 1. Video Filter: Zoom 1.03x, crop trung tâm, unsharp làm nét, tăng contrast & saturation
-    vf_filter = (
-        f"scale=iw*{zoom_ratio}:ih*{zoom_ratio}:flags=lanczos,"
-        f"crop=iw/{zoom_ratio}:ih/{zoom_ratio},"
-        f"unsharp=3:3:0.8:3:3:0.0,"
-        f"eq=contrast=1.02:saturation=1.04"
-    )
+    # 1. Đo đạc kích thước video gốc
+    metrics = probe_video_metrics(input_path)
+    w = metrics.get("width", 1080)
+    h = metrics.get("height", 1920)
+    aspect = w / h if h > 0 else 9 / 16
 
-    # 2. Audio Filter: Pitch shift 2.5% + tempo adjust để giữ nguyên độ dài
+    encoder_args = detect_best_video_encoder()
+    enc_name = encoder_args[1] if len(encoder_args) > 1 else "libx264"
+    log(f"⚡ Sử dụng bộ mã hóa tăng tốc: [{enc_name.upper()}] | Khung hình: [{crop_mode}]")
+
+    # 2. Xây dựng bộ lọc video theo chế độ crop
+    cmd = [FFMPEG_BIN, "-y", "-i", input_path]
+
+    # Audio Filter: Pitch shift 2.5% + tempo adjust để giữ nguyên độ dài
     if enable_audio_mod:
         af_filter = "asetrate=44100*1.025,aresample=44100,atempo=0.9756"
     else:
         af_filter = "aresample=44100"
 
-    encoder_args = detect_best_video_encoder()
-    enc_name = encoder_args[1] if len(encoder_args) > 1 else "libx264"
-    log(f"⚡ Sử dụng bộ mã hóa tăng tốc: [{enc_name.upper()}]")
+    if crop_mode == "blur_9_16" and aspect > 0.6:
+        # Nền mờ 9:16 phía sau, video sắc nét ở giữa
+        filter_complex = (
+            "[0:v]scale=180:320:force_original_aspect_ratio=increase,crop=180:320,boxblur=5:1,scale=1080:1920:flags=fast_bilinear[bg];"
+            f"[0:v]scale=1080:-2:force_original_aspect_ratio=decrease,scale=iw*{zoom_ratio}:ih*{zoom_ratio},crop=iw/{zoom_ratio}:ih/{zoom_ratio},unsharp=3:3:0.8:3:3:0.0,eq=contrast=1.02:saturation=1.04[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+        )
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a?",
+            "-af", af_filter
+        ])
+    elif crop_mode == "crop_9_16":
+        # Cắt dọc 9:16 tâm
+        if aspect >= 9/16:
+            vf_crop = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920"
+        else:
+            vf_crop = "crop=iw:iw*16/9:0:(ih-iw*16/9)/2,scale=1080:1920"
+        vf_filter = (
+            f"{vf_crop},"
+            f"scale=iw*{zoom_ratio}:ih*{zoom_ratio}:flags=lanczos,"
+            f"crop=iw/{zoom_ratio}:ih/{zoom_ratio},"
+            f"unsharp=3:3:0.8:3:3:0.0,"
+            f"eq=contrast=1.02:saturation=1.04"
+        )
+        cmd.extend(["-vf", vf_filter, "-af", af_filter])
+    elif crop_mode == "crop_1_1":
+        # Cắt vuông 1:1
+        vf_filter = (
+            "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2,scale=1080:1080,"
+            f"scale=iw*{zoom_ratio}:ih*{zoom_ratio}:flags=lanczos,"
+            f"crop=iw/{zoom_ratio}:ih/{zoom_ratio},"
+            f"unsharp=3:3:0.8:3:3:0.0,"
+            f"eq=contrast=1.02:saturation=1.04"
+        )
+        cmd.extend(["-vf", vf_filter, "-af", af_filter])
+    else:
+        # Giữ nguyên tỷ lệ gốc, chuẩn hóa 1080p, zoom nhẹ lách hash, làm nét & đổi sắc độ
+        vf_filter = (
+            f"scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':-2:flags=lanczos,"
+            f"scale=iw*{zoom_ratio}:ih*{zoom_ratio}:flags=lanczos,"
+            f"crop=iw/{zoom_ratio}:ih/{zoom_ratio},"
+            f"unsharp=3:3:0.8:3:3:0.0,"
+            f"eq=contrast=1.02:saturation=1.04"
+        )
+        cmd.extend(["-vf", vf_filter, "-af", af_filter])
 
-    cmd = [
-        FFMPEG_BIN, "-y", "-i", input_path,
-        "-vf", vf_filter,
-        "-af", af_filter,
+    cmd.extend([
         *encoder_args,
         "-c:a", "aac", "-b:a", "192k",
-        "-map_metadata", "-1",
-        output_path
-    ]
+        "-map_metadata", "-1"
+    ])
+
+    # 3. Giả lập Metadata Camera Điện Thoại Thật (chống 0 view)
+    if fake_mobile_camera:
+        dev = random.choice(MOBILE_CAMERA_PRESETS)
+        cmd.extend([
+            "-metadata", f"make={dev['make']}",
+            "-metadata", f"model={dev['model']}",
+            "-metadata", f"encoder={dev['encoder']}",
+            "-metadata", f"comment={dev['comment']}"
+        ])
+
+    cmd.append(output_path)
 
     try:
         start_t = datetime.now()

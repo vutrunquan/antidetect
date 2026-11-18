@@ -24,6 +24,7 @@ from platform_utils import (
     get_subprocess_kwargs, detect_best_video_encoder, load_config
 )
 from browser_runner import parse_proxy
+from proxy_bridge import setup_camoufox_proxy
 from video_remix_engine import (
     render_anti_copyright_video,
     remedy_audio_with_bgm,
@@ -124,6 +125,7 @@ def init_db():
         daily_target INTEGER DEFAULT 2,
         status TEXT DEFAULT 'ACTIVE',
         title_mode TEXT DEFAULT 'ai_rewrite',
+        order_mode TEXT DEFAULT 'oldest_first',
         post_to_tiktok INTEGER DEFAULT 1,
         post_to_youtube INTEGER DEFAULT 1,
         created_at TEXT DEFAULT ''
@@ -136,6 +138,13 @@ def init_db():
         ("daily_target", "INTEGER DEFAULT 2"),
         ("status", "TEXT DEFAULT 'ACTIVE'"),
         ("title_mode", "TEXT DEFAULT 'ai_rewrite'"),
+        ("order_mode", "TEXT DEFAULT 'oldest_first'"),
+        ("crop_mode", "TEXT DEFAULT 'blur_9_16'"),
+        ("series_name", "TEXT DEFAULT ''"),
+        ("jitter_enabled", "INTEGER DEFAULT 1"),
+        ("health_score", "INTEGER DEFAULT 85"),
+        ("health_status", "TEXT DEFAULT 'healthy'"),
+        ("last_audit_time", "TEXT DEFAULT ''"),
         ("post_to_tiktok", "INTEGER DEFAULT 1"),
         ("post_to_youtube", "INTEGER DEFAULT 1"),
         ("created_at", "TEXT DEFAULT ''")
@@ -152,7 +161,11 @@ def init_db():
         ("source_handle", "TEXT DEFAULT ''"),
         ("tiktok_user", "TEXT DEFAULT ''"),
         ("tiktok_video_url", "TEXT DEFAULT ''"),
+        ("yt_source_url", "TEXT DEFAULT ''"),
         ("vpn_region", "TEXT DEFAULT ''"),
+        ("crop_mode", "TEXT DEFAULT 'original'"),
+        ("series_name", "TEXT DEFAULT ''"),
+        ("episode_num", "INTEGER DEFAULT 0"),
         ("quality_str", "TEXT DEFAULT ''"),
         ("duration", "REAL DEFAULT 0.0"),
         ("check_status", "TEXT DEFAULT ''"),
@@ -176,9 +189,18 @@ def init_db():
     conn.close()
 
 def is_video_processed(video_id: str) -> bool:
+    if not video_id:
+        return False
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM videos WHERE video_id = ?", (video_id,))
+    cur.execute("""
+        SELECT 1 FROM videos 
+        WHERE video_id = ? 
+           OR video_id LIKE ? 
+           OR local_4k_path LIKE ?
+           OR yt_video_url LIKE ?
+           OR yt_source_url LIKE ?
+    """, (video_id, f"%{video_id}%", f"%{video_id}%", f"%{video_id}%", f"%{video_id}%"))
     exists = cur.fetchone() is not None
     conn.close()
     return exists
@@ -188,8 +210,10 @@ def save_video_record(
     shorts_title, local_4k_path, caption, status,
     yt_status="NONE", yt_video_url="",
     account_id="", source_handle="", tiktok_user="", tiktok_video_url="",
+    yt_source_url="",
     vpn_region="VN", quality_str="", duration=0.0, check_status="",
-    posted_date=None, channel_id=0
+    posted_date=None, channel_id=0,
+    crop_mode="blur_9_16", series_name="", episode_num=0
 ):
     conn = sqlite3.connect(DB_PATH)
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -198,10 +222,12 @@ def save_video_record(
     conn.execute("""
     INSERT OR REPLACE INTO videos 
     (video_id, profile_name, profile_dir, proxy_server, shorts_title, local_4k_path, caption, status, yt_status, yt_video_url, created_at,
-     account_id, source_handle, tiktok_user, tiktok_video_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id,
+     crop_mode, series_name, episode_num)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (video_id, profile_name, profile_dir, proxy_server, shorts_title, local_4k_path, caption, status, yt_status, yt_video_url, created_at,
-          account_id, source_handle, tiktok_user, tiktok_video_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id))
+          account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id,
+          crop_mode, series_name, episode_num))
     conn.commit()
     conn.close()
 
@@ -254,7 +280,10 @@ def add_tracked_channel(
     source_handle: str = "",
     daily_target: int = 2,
     status: str = "ACTIVE",
-    title_mode: str = "ai_rewrite"
+    title_mode: str = "ai_rewrite",
+    order_mode: str = "oldest_first",
+    crop_mode: str = "blur_9_16",
+    series_name: str = ""
 ):
     norm_url, parsed_handle = parse_youtube_channel_input(yt_url)
     if not source_handle:
@@ -262,6 +291,8 @@ def add_tracked_channel(
     if not account_id:
         account_id = generate_account_id()
     norm_title_mode = "keep_original" if str(title_mode).strip().lower() == "keep_original" else "ai_rewrite"
+    norm_order_mode = "newest_first" if str(order_mode).strip().lower() == "newest_first" else "oldest_first"
+    norm_crop_mode = str(crop_mode).strip() if crop_mode else "blur_9_16"
 
     if not profile_dir:
         profile_dir = os.path.join(BASE_DIR, "profiles", profile_name.replace(" ", "_"))
@@ -271,10 +302,10 @@ def add_tracked_channel(
     conn.execute("""
     INSERT OR REPLACE INTO channels 
     (youtube_shorts_url, tiktok_user, vpn_region, profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-     account_id, source_handle, daily_target, status, title_mode)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     account_id, source_handle, daily_target, status, title_mode, order_mode, crop_mode, series_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (norm_url, tiktok_user, vpn_region.upper(), profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-          account_id, source_handle, daily_target, status.upper(), norm_title_mode))
+          account_id, source_handle, daily_target, status.upper(), norm_title_mode, norm_order_mode, norm_crop_mode, series_name.strip()))
     conn.commit()
     conn.close()
 
@@ -314,7 +345,7 @@ def update_channel_details(channel_id: int, data: dict):
     conn = sqlite3.connect(DB_PATH)
     fields = []
     vals = []
-    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "title_mode", "post_to_tiktok", "post_to_youtube"]:
+    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "title_mode", "order_mode", "post_to_tiktok", "post_to_youtube", "crop_mode", "series_name", "jitter_enabled"]:
         if k in data:
             fields.append(f"{k} = ?")
             vals.append(data[k])
@@ -376,6 +407,7 @@ def get_all_channels_kpi_summary(target_date: str = None) -> dict:
             "vpn_region": ch.get("vpn_region", "VN"),
             "status": ch_status,
             "title_mode": (ch.get("title_mode") or "ai_rewrite").lower(),
+            "order_mode": (ch.get("order_mode") or "oldest_first").lower(),
             "daily_target": daily_target,
             "posted": posted,
             "missing": max(0, daily_target - posted)
@@ -508,20 +540,23 @@ def verify_downloaded_file_quality(file_path: str, return_fps: bool = False):
         return False, 0, 0, err_lbl
 
 
-def edit_and_upscale_4k(raw_path: str, output_path: str, log_callback=None) -> dict:
+def edit_and_upscale_4k(raw_path: str, output_path: str, crop_mode: str = "blur_9_16", fake_mobile_camera: bool = True, log_callback=None) -> dict:
     """
     Video Remix Engine (FFmpeg Pipeline):
     1. Zoom nhẹ 1.03x + crop trung tâm để đổi toàn bộ tọa độ pixel và mã băm hash frame.
-    2. Bộ lọc unsharp (làm nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
-    3. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x để lách Content ID nhưng giữ nguyên độ dài.
-    4. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1).
-    5. Hỗ trợ toàn bộ độ dài video (không cắt giới hạn 59s).
+    2. Cắt chuyển đổi khung hình linh hoạt (original, blur_9_16 nền mờ nghệ thuật, crop_9_16, crop_1_1).
+    3. Bộ lọc unsharp (làm nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
+    4. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x để lách Content ID nhưng giữ nguyên độ dài.
+    5. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1) và chèn Metadata Camera Điện Thoại Thật (iPhone 15 Pro Max/S23 Ultra) để lách quét 0-view.
+    6. Hỗ trợ toàn bộ độ dài video (không cắt giới hạn 59s).
     """
     rendered_path = render_anti_copyright_video(
         input_path=raw_path,
         output_path=output_path,
         zoom_ratio=1.03,
         enable_audio_mod=True,
+        crop_mode=crop_mode,
+        fake_mobile_camera=fake_mobile_camera,
         log_callback=log_callback
     )
 
@@ -541,12 +576,12 @@ def remedy_audio_fast(video_4k_path: str, remedied_output_path: str, log_callbac
     return remedy_audio_with_bgm(video_4k_path, remedied_output_path, log_callback=log_callback)
 
 
-def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_callback=None) -> dict | None:
+def download_and_verify_youtube_video(video_url: str, log_callback=None) -> dict | None:
     """
-    Quét và tải video Shorts mới nhất chưa từng xử lý:
+    Tải và kiểm định chất lượng HD/Full HD của 1 video YouTube theo URL cụ thể:
     - Bật extractor_args tránh SABR 360p của YouTube.
     - Chốt chặn bảo vệ chất lượng HD 720p/1080p: nếu video mới đăng (< 30 phút) và đang chờ encode HD,
-      hệ thống sẽ CHỜ YouTube hoàn tất encode bản 1080p chứ không vội tải bản 360p mờ.
+      hệ thống sẽ báo trạng thái chờ YouTube hoàn tất encode bản 1080p.
     - Tải bản chất lượng cao nhất (4K > 2K > 1080p60 > 1080p > 720p60 > 720p).
     - Đo đạc thực tế bằng ffprobe.
     """
@@ -555,7 +590,7 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_call
             try: log_callback(msg)
             except Exception: pass
         else:
-            print(f"[Fetch Shorts]: {msg}")
+            print(f"[Download Video]: {msg}")
 
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
@@ -564,46 +599,7 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_call
 
     common_extractor_args = {"youtube": {"player_client": ["default", "web_embedded"]}}
 
-    ydl_info_opts = {
-        "extract_flat": True,
-        "playlist_items": f"1-{max_lookback}",
-        "quiet": True,
-        "js_runtimes": js_runtimes,
-        "extractor_args": common_extractor_args
-    }
-
-    with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
-        try:
-            info = ydl.extract_info(channel_shorts_url, download=False)
-        except Exception as e:
-            _log(f"❌ [yt-dlp error]: {e}")
-            return None
-
-        if not info or "entries" not in info or not info["entries"]:
-            return None
-
-        candidate_entry = None
-        for entry in info["entries"]:
-            if not entry:
-                continue
-            v_id = entry.get("id")
-            if not v_id or is_video_processed(v_id):
-                continue
-            dur = entry.get("duration")
-            # Hỗ trợ video TikTok Studio lên tới 10 phút (600s)
-            if dur and dur > 600:
-                continue
-            candidate_entry = entry
-            break
-
-        if not candidate_entry:
-            return None
-
-        target_id = candidate_entry.get("id")
-        video_url = f"https://www.youtube.com/shorts/{target_id}"
-
-    # Lấy thông tin format chi tiết để kiểm định chất lượng 1080p/720p trước khi tải
-    _log(f"🔍 Kiểm tra chất lượng formats trên YouTube cho video [{target_id}]...")
+    _log(f"🔍 Kiểm tra chất lượng formats trên YouTube cho video [{video_url}]...")
     ydl_detail_opts = {
         "quiet": True,
         "js_runtimes": js_runtimes,
@@ -613,9 +609,13 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_call
         try:
             full_info = ydl.extract_info(video_url, download=False)
         except Exception as e:
-            _log(f"⚠️ Không thể lấy format video {video_url}: {e}")
+            _log(f"⚠️ Không thể lấy thông tin video {video_url}: {e}")
             return None
 
+        if not full_info:
+            return None
+
+        target_id = full_info.get("id")
         formats = full_info.get("formats", [])
         is_hd, best_w, best_h, best_fps, best_tbr, qual_label = get_best_format_metrics(formats)
 
@@ -623,7 +623,7 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_call
         vid_ts = full_info.get("timestamp") or full_info.get("release_timestamp") or 0
         age_minutes = (now_ts - vid_ts) / 60 if vid_ts else 0
 
-        # Chốt chặn chất lượng: Nếu video mới tải lên (< 30 phút) mà chưa có bản HD 720p/1080p -> Chờ YouTube encode
+        # Nếu video mới đăng (< 30 phút) và chưa có bản HD 720p/1080p -> Chờ YouTube encode
         if not is_hd:
             if vid_ts and age_minutes > 30:
                 _log(f"⛔ [BỎ QUA - CHẤT LƯỢNG KÉM < 720p] Video \"{full_info.get('title')}\" chỉ có {qual_label} sau hơn 30 phút. Bỏ qua.")
@@ -659,32 +659,152 @@ def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 10, log_call
         is_ok, real_w, real_h, verified_qual, real_fps = verify_downloaded_file_quality(raw_path, return_fps=True)
         _log(f"✅ Đã tải xong video! Đo đạc thực tế ffprobe: {verified_qual}")
 
+        canonical_url = f"https://www.youtube.com/shorts/{target_id}"
         return {
             "video_id": target_id,
             "title": (download_info.get("title") or full_info.get("title") or "").strip(),
             "description": (download_info.get("description") or full_info.get("description") or "").strip(),
             "uploader": download_info.get("uploader", "YouTube Channel"),
-            "url": video_url,
+            "url": canonical_url,
             "raw_path": raw_path,
             "duration": download_info.get("duration", full_info.get("duration", 59.0)),
             "quality_str": verified_qual,
             "is_1080": min(real_w, real_h) >= 1070
         }
 
+def fetch_channel_short(channel_shorts_url: str, order_mode: str = "oldest_first", max_lookback: int = 300, log_callback=None) -> dict | None:
+    """
+    Quét danh sách video từ kênh YouTube và chọn video phù hợp:
+    - Nếu order_mode == 'oldest_first': Quét từ video CŨ NHẤT tịnh tiến dần lên mới nhất chưa từng xử lý.
+    - Nếu order_mode == 'newest_first': Quét từ video MỚI NHẤT chưa từng xử lý.
+    """
+    def _log(msg):
+        if log_callback:
+            try: log_callback(msg)
+            except Exception: pass
+        else:
+            print(f"[Fetch Channel]: {msg}")
+
+    node_bin = shutil.which("node")
+    js_runtimes = {"node": {}} if node_bin else {}
+    common_extractor_args = {"youtube": {"player_client": ["default", "web_embedded"]}}
+
+    ydl_info_opts = {
+        "extract_flat": True,
+        "playlist_items": f"1-{max_lookback}",
+        "quiet": True,
+        "js_runtimes": js_runtimes,
+        "extractor_args": common_extractor_args
+    }
+
+    with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
+        try:
+            info = ydl.extract_info(channel_shorts_url, download=False)
+        except Exception as e:
+            _log(f"❌ [yt-dlp error]: {e}")
+            return None
+
+        if not info or "entries" not in info or not info["entries"]:
+            return None
+
+        raw_entries = [e for e in info["entries"] if e and e.get("id")]
+        if not raw_entries:
+            return None
+
+        is_oldest = str(order_mode).strip().lower() == "oldest_first"
+        if is_oldest:
+            candidate_list = list(reversed(raw_entries))
+            _log(f"⏳ Thứ tự duyệt: TỪ CŨ NHẤT ➔ MỚI DẦN (Tổng {len(raw_entries)} video trên kênh)")
+        else:
+            candidate_list = raw_entries
+            _log(f"⚡ Thứ tự duyệt: TỪ MỚI NHẤT ➔ CŨ DẦN (Tổng {len(raw_entries)} video trên kênh)")
+
+        for entry in candidate_list:
+            v_id = entry.get("id")
+            if not v_id or is_video_processed(v_id):
+                continue
+            dur = entry.get("duration")
+            # Hỗ trợ video TikTok Studio lên tới 10 phút (600s)
+            if dur and dur > 600:
+                continue
+
+            v_title = entry.get("title", "")
+            _log(f"🎯 Đã chọn video chưa đăng: [{v_id}] '{v_title}'")
+            candidate_url = f"https://www.youtube.com/shorts/{v_id}"
+            downloaded = download_and_verify_youtube_video(candidate_url, log_callback=log_callback)
+            if downloaded:
+                return downloaded
+            else:
+                _log(f"⚠️ Video [{v_id}] không tải được hoặc chưa đạt chuẩn, tiếp tục tìm video kế tiếp...")
+                continue
+
+    _log("ℹ️ Đã duyệt hết danh sách video trên kênh nhưng không còn video nào mới chưa đăng.")
+    return None
+
+def fetch_latest_short(channel_shorts_url: str, max_lookback: int = 50, log_callback=None) -> dict | None:
+    return fetch_channel_short(channel_shorts_url, order_mode="newest_first", max_lookback=max_lookback, log_callback=log_callback)
+
+def fetch_specific_video(video_url: str, log_callback=None) -> dict | None:
+    """Tải và kiểm định chính xác video theo URL mà người dùng chỉ định."""
+    return download_and_verify_youtube_video(video_url, log_callback=log_callback)
+
 
 # ================= 3. CAMOUFOX BROWSER LAUNCHER =================
+def kill_profile_processes(profile_dir: str):
+    """
+    Dập tắt tất cả process đang chiếm dụng profile_dir (camoufox, firefox, browser_runner, python)
+    để giải phóng tài nguyên và tránh xung đột lock hoặc bị Firefox forward lệnh sang cửa sổ trắng (about:blank).
+    """
+    profile_dir = os.path.abspath(profile_dir)
+    profile_id = os.path.basename(profile_dir).lower()
+    my_pid = os.getpid()
+
+    try:
+        import psutil
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if p.info['pid'] == my_pid:
+                    continue
+                pname = (p.info['name'] or '').lower()
+                if not any(x in pname for x in ['camoufox', 'firefox', 'python']):
+                    continue
+                cmdline = ' '.join(p.info['cmdline'] or []).lower()
+                if profile_id in cmdline or profile_dir.lower() in cmdline:
+                    p.kill()
+            except Exception:
+                pass
+        time.sleep(0.5)
+    except Exception:
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    f'powershell -Command "Get-CimInstance Win32_Process | Where-Object {{ ($_.CommandLine -like \'*{profile_id}*\') -and ($_.ProcessId -ne {my_pid}) }} | Stop-Process -Force"',
+                    shell=True,
+                    capture_output=True,
+                    timeout=5
+                )
+            except Exception:
+                pass
+
+    # Dọn dẹp triệt để các file lock
+    for lock_name in [".parentlock", "lock", "parent.lock"]:
+        lp = os.path.join(profile_dir, lock_name)
+        for _ in range(5):
+            if os.path.exists(lp):
+                try:
+                    os.remove(lp)
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            else:
+                break
+
 def _prepare_camoufox_kwargs(profile_dir: str, proxy_server: str = "", os_type: str = "windows", screen: str = "1920x1080", locale: str = "", headless: bool = False) -> dict:
     profile_dir = os.path.abspath(profile_dir)
     os.makedirs(profile_dir, exist_ok=True)
 
-    # Dọn dẹp lock cũ
-    for lock_name in [".parentlock", "lock", "parent.lock"]:
-        lp = os.path.join(profile_dir, lock_name)
-        if os.path.exists(lp):
-            try:
-                os.remove(lp)
-            except Exception:
-                pass
+    # Đảm bảo dọn dẹp tiến trình cũ và file khóa
+    kill_profile_processes(profile_dir)
 
     camoufox_kwargs = {
         "headless": headless,
@@ -695,6 +815,7 @@ def _prepare_camoufox_kwargs(profile_dir: str, proxy_server: str = "", os_type: 
         "disable_coop": True,
         "canvas_noise": False,
         "i_know_what_im_doing": True,
+        "timeout": 60000,
     }
 
     if screen and "x" in screen:
@@ -707,7 +828,7 @@ def _prepare_camoufox_kwargs(profile_dir: str, proxy_server: str = "", os_type: 
     if locale.strip():
         camoufox_kwargs["locale"] = locale.strip()
 
-    proxy_cfg = parse_proxy(proxy_server) if proxy_server else None
+    proxy_cfg, _ = setup_camoufox_proxy(proxy_server) if proxy_server else (None, None)
     if proxy_cfg:
         camoufox_kwargs["proxy"] = proxy_cfg
         camoufox_kwargs["geoip"] = True
@@ -720,18 +841,84 @@ def open_profile_warmup(profile_dir: str, proxy_server: str = "", target_url: st
     lock = get_profile_lock(lock_name)
     with lock:
         kwargs = _prepare_camoufox_kwargs(profile_dir, proxy_server, os_type=os_type, headless=False)
-        with Camoufox(**kwargs) as context:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto(target_url, timeout=60000)
-            # Chờ người dùng đóng tab
-            while len(context.pages) > 0:
-                time.sleep(1)
+        try:
+            with Camoufox(**kwargs) as context:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(target_url, timeout=60000)
+                # Chờ người dùng đóng tab
+                while len(context.pages) > 0:
+                    time.sleep(1)
+        except Exception as e:
+            if ("Failed to get IP address" in str(e) or "BadStatusLine" in str(e) or "geoip" in str(e).lower()) and kwargs.get("geoip"):
+                kwargs["geoip"] = False
+                with Camoufox(**kwargs) as context:
+                    page = context.pages[0] if context.pages else context.new_page()
+                    page.goto(target_url, timeout=60000)
+                    while len(context.pages) > 0:
+                        time.sleep(1)
+            else:
+                raise
 
 def dismiss_tiktok_popups(page, logger=None):
     """
-    Tự động tắt các popup, overlay hướng dẫn (Joyride tour / tooltips / modal) của TikTok Studio
-    để tránh lỗi <div class="react-joyride__overlay"> subtree intercepts pointer events.
+    Tự động tắt các popup, overlay hướng dẫn (Joyride tour / tooltips / modal / TUXModal) của TikTok Studio
+    để tránh lỗi subtree intercepts pointer events.
     """
+    def _log(msg):
+        if logger:
+            try: logger(msg)
+            except Exception: pass
+
+    # 1. Bấm xác nhận các modal yêu cầu bật tính năng hoặc bỏ qua bản nháp
+    for btn_kw in [
+        'button:has-text("Turn on")',
+        'button:has-text("Activar")',
+        'button:has-text("Bật")',
+        'button:has-text("Confirm")',
+        'button:has-text("Confirmar")',
+        'button:has-text("Xác nhận")',
+        'button:has-text("Discard")',
+        'button:has-text("Hủy bỏ")',
+        'button:has-text("Loại bỏ")',
+        'button:has-text("Bỏ bản nháp")',
+        'button:has-text("Post anyway")',
+        'button:has-text("Đăng ngay")',
+        'button:has-text("Tiếp tục đăng")',
+        'button:has-text("Got it")',
+        'button:has-text("Entendido")',
+        'button:has-text("Đã hiểu")',
+        'button:has-text("Skip")',
+        'button:has-text("Bỏ qua")',
+        'button:has-text("Dismiss")',
+        'button:has-text("Aceptar")',
+        'button[aria-label="Close"]',
+        'button[aria-label="Đóng"]',
+        'button[aria-label="Cerrar"]'
+    ]:
+        try:
+            btn = page.locator(f'.TUXModal {btn_kw}, [data-floating-ui-portal] {btn_kw}, div[role="dialog"] {btn_kw}, {btn_kw}').first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(force=True, timeout=1200)
+                _log(f"⚡ Đã xử lý popup TikTok Studio: {btn_kw}")
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    # 1.1 Quét JS thông minh các button xử lý nhanh (Discard unsaved draft / Turn on checks / Post anyway)
+    try:
+        page.evaluate("""() => {
+            const buttons = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"]'));
+            for (const b of buttons) {
+                const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if (['discard', 'hủy bỏ', 'loại bỏ', 'bỏ bản nháp', 'post anyway', 'đăng ngay', 'tiếp tục đăng'].includes(text)) {
+                    b.click();
+                }
+            }
+        }""")
+    except Exception:
+        pass
+
+    # 2. Xóa sạch overlay DOM nếu vẫn còn sót chắn chuột
     try:
         page.evaluate("""() => {
             try {
@@ -742,28 +929,6 @@ def dismiss_tiktok_popups(page, logger=None):
         }""")
     except Exception:
         pass
-
-    for sel in [
-        '#react-joyride-portal button[aria-label="Close"]',
-        '#react-joyride-portal button:has-text("Skip")',
-        '#react-joyride-portal button:has-text("Got it")',
-        '#react-joyride-portal button:has-text("Bỏ qua")',
-        '#react-joyride-portal button:has-text("Đã hiểu")',
-        'div[role="dialog"] button:has-text("Got it")',
-        'div[role="dialog"] button:has-text("Đã hiểu")',
-        'div[role="dialog"] button:has-text("Bỏ qua")',
-        'button:has-text("Got it")',
-        'button:has-text("Đã hiểu")',
-        'button:has-text("Dismiss")',
-        'button[aria-label="Close"]',
-        'button[aria-label="Đóng"]'
-    ]:
-        try:
-            btn = page.locator(sel)
-            if btn.count() > 0 and btn.first.is_visible():
-                btn.first.click(force=True, timeout=1000)
-        except Exception:
-            pass
 
 def toggle_auto_copyright_and_content_checks(page, log=None):
     """
@@ -1101,7 +1266,7 @@ def upload_to_tiktok_with_fallback(
                         except Exception as e:
                             _log(f"❌ Auto login thất bại: {e}")
 
-                # 1. Tải file video 4K lần 1
+                # 1. Tải file video lên TikTok
                 _log("📁 Đang đưa file video vào trình tải lên TikTok...")
                 dismiss_tiktok_popups(page, _log)
                 file_input = page.locator('input[type="file"]')
@@ -1120,17 +1285,62 @@ def upload_to_tiktok_with_fallback(
                     dismiss_tiktok_popups(page, _log)
                     caption_box.click(force=True)
 
-                # Xóa sạch text mặc định
-                page.keyboard.press(SELECT_ALL_SHORTCUT)
-                page.keyboard.press("Backspace")
-                time.sleep(0.5)
+                # Xóa sạch text mặc định và chèn caption bằng native event
                 try:
-                    caption_box.fill(caption)
+                    page.evaluate("""(text) => {
+                        const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+                        if (el) {
+                            el.focus();
+                            document.execCommand('selectAll', false, null);
+                            document.execCommand('delete', false, null);
+                            document.execCommand('insertText', false, text);
+                        }
+                    }""", caption)
                 except Exception:
-                    page.keyboard.type(caption, delay=20)
+                    pass
+
+                typed_len = page.evaluate("""() => {
+                    const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+                    return el ? (el.innerText || '').trim().length : 0;
+                }""")
+                if typed_len == 0:
+                    page.keyboard.press(SELECT_ALL_SHORTCUT)
+                    page.keyboard.press("Backspace")
+                    time.sleep(0.3)
+                    page.keyboard.insert_text(caption)
                 time.sleep(1)
 
-                # 3. Kích hoạt công tắc Content Check Lite & Theo dõi kết quả
+                # 3. Chờ video upload hoàn tất lên máy chủ TikTok (Upload 100%)
+                _log("⏳ Đang tải video lên máy chủ TikTok và đợi nạp hoàn tất...")
+                upload_finished = False
+                for up_tick in range(60):  # Tối đa 180s (60 x 3s)
+                    time.sleep(3)
+                    if up_tick % 3 == 0:
+                        dismiss_tiktok_popups(page, _log)
+
+                    post_btn_chk = page.locator('button:has-text("Post"), button:has-text("Đăng"), button:has-text("Publicar")').last
+                    if post_btn_chk.count() > 0:
+                        is_dis = post_btn_chk.is_disabled() or (post_btn_chk.get_attribute("aria-disabled") or "").lower() == "true"
+                        if not is_dis:
+                            upload_finished = True
+                            _log("✅ Video đã tải lên hoàn tất (Nút Đăng/Publicar đã sẵn sàng)!")
+                            break
+
+                    prog_info = page.evaluate("""() => {
+                        const prog = document.querySelector('[class*="progress"], [class*="upload-progress"], [class*="upload-info"]');
+                        if (prog) return prog.innerText.trim();
+                        const uploadedBadge = document.querySelector('[class*="uploaded"], [class*="success"]');
+                        if (uploadedBadge) return uploadedBadge.innerText.trim();
+                        return "";
+                    }""")
+                    if prog_info and any(k in prog_info.lower() for k in ["uploaded", "subido", "hoàn tất", "100%"]):
+                        upload_finished = True
+                        _log(f"✅ Video đã tải lên hoàn tất: {prog_info}")
+                        break
+                    elif prog_info and up_tick % 2 == 0:
+                        _log(f"📊 Tiến độ tải video lên TikTok: {prog_info}")
+
+                # 4. Kích hoạt công tắc Content Check Lite & Theo dõi kết quả
                 toggle_auto_copyright_and_content_checks(page, _log)
                 _log("⏳ Đang theo dõi quét bản quyền Content Check Lite (tối đa 90s)...")
                 is_green, check_status = wait_for_content_check(page, max_wait_seconds=90, log_callback=_log)
@@ -1205,13 +1415,28 @@ def upload_to_tiktok_with_fallback(
                             dismiss_tiktok_popups(page, _log)
                             caption_box.click(force=True)
 
-                        page.keyboard.press(SELECT_ALL_SHORTCUT)
-                        page.keyboard.press("Backspace")
-                        time.sleep(0.5)
                         try:
-                            caption_box.fill(caption)
+                            page.evaluate("""(text) => {
+                                const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+                                if (el) {
+                                    el.focus();
+                                    document.execCommand('selectAll', false, null);
+                                    document.execCommand('delete', false, null);
+                                    document.execCommand('insertText', false, text);
+                                }
+                            }""", caption)
                         except Exception:
-                            page.keyboard.type(caption, delay=20)
+                            pass
+
+                        typed_len = page.evaluate("""() => {
+                            const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+                            return el ? (el.innerText || '').trim().length : 0;
+                        }""")
+                        if typed_len == 0:
+                            page.keyboard.press(SELECT_ALL_SHORTCUT)
+                            page.keyboard.press("Backspace")
+                            time.sleep(0.3)
+                            page.keyboard.insert_text(caption)
                         time.sleep(1)
 
                     toggle_auto_copyright_and_content_checks(page, _log)
@@ -1225,17 +1450,109 @@ def upload_to_tiktok_with_fallback(
                 # 5. QUYẾT ĐỊNH ĐĂNG HOẶC LƯU NHÁP (TẦNG 2)
                 dismiss_tiktok_popups(page, _log)
                 if is_green:
-                    _log("🚀 Video đạt chuẩn bản quyền! Đang bấm nút Đăng (Post)...")
+                    _log("🚀 Video đạt chuẩn bản quyền! Chuẩn bị bấm nút Đăng (Post / Publicar)...")
                     post_btn = page.locator('button:has-text("Post"), button:has-text("Đăng"), button:has-text("Publicar")').last
                     post_btn.scroll_into_view_if_needed()
+
+                    # Đảm bảo nút Đăng đã enabled thực sự
+                    for wait_b in range(20):
+                        if post_btn.count() > 0 and not post_btn.is_disabled() and (post_btn.get_attribute("aria-disabled") or "").lower() != "true":
+                            break
+                        time.sleep(2)
+                        dismiss_tiktok_popups(page, _log)
+
                     try:
                         post_btn.click(timeout=5000)
                     except Exception:
                         dismiss_tiktok_popups(page, _log)
                         post_btn.click(force=True)
-                    time.sleep(8)
-                    _log("✅ Đã xuất bản thành công lên TikTok!")
-                    return {"action": "PUBLISHED", "check_status": check_status}
+
+                    _log("⏳ Đã bấm nút Đăng! Đang chờ TikTok Studio xác nhận xuất bản video...")
+
+                    # Bấm nút xác nhận trên modal nếu có (VD: "¿Seguir con la publicación?" -> "Publicar ahora")
+                    time.sleep(1.5)
+                    for post_confirm_sel in [
+                        'button:has-text("Publicar ahora")',
+                        'button:has-text("Post now")',
+                        'button:has-text("Đăng ngay")',
+                        'button:has-text("Publish now")',
+                        'div[role="dialog"] button:has-text("Publicar")',
+                        'div[role="dialog"] button:has-text("Post")',
+                        'div[role="dialog"] button:has-text("Đăng")'
+                    ]:
+                        try:
+                            cf_btn = page.locator(post_confirm_sel).first
+                            if cf_btn.count() > 0 and cf_btn.is_visible():
+                                cf_btn.click(force=True, timeout=2500)
+                                _log(f"⚡ Đã bấm nút xác nhận đăng cuối cùng: {post_confirm_sel}!")
+                                time.sleep(1)
+                                break
+                        except Exception:
+                            pass
+
+                    # Chốt chặn kiểm chứng: Xác nhận TikTok đã thực sự xuất bản video
+                    publish_confirmed = False
+                    for conf_tick in range(25):  # Chờ tối đa 50s
+                        time.sleep(2)
+                        dismiss_tiktok_popups(page, _log)
+
+                        # Kiểm tra lại nút Publicar ahora nếu modal xuất hiện muộn
+                        for post_confirm_sel in [
+                            'button:has-text("Publicar ahora")',
+                            'button:has-text("Post now")',
+                            'button:has-text("Đăng ngay")',
+                            'button:has-text("Publish now")'
+                        ]:
+                            try:
+                                cf_btn = page.locator(post_confirm_sel).first
+                                if cf_btn.count() > 0 and cf_btn.is_visible():
+                                    cf_btn.click(force=True, timeout=2000)
+                                    _log(f"⚡ Đã bấm nút xác nhận đăng: {post_confirm_sel}!")
+                                    time.sleep(1)
+                                    break
+                            except Exception:
+                                pass
+
+                        curr_url = page.url.lower()
+
+                        if "tiktokstudio/content" in curr_url or "creator-center/content" in curr_url:
+                            publish_confirmed = True
+                            _log(f"🎉 TikTok đã chuyển hướng thành công đến trang quản lý video ({curr_url})!")
+                            break
+
+                        success_indicator = page.evaluate("""() => {
+                            const txt = (document.body ? document.body.innerText : "").toLowerCase();
+                            const successKws = [
+                                "your video has been published", "your video was published",
+                                "tu video se ha publicado", "tu video ha sido publicado",
+                                "video của bạn đã được xuất bản", "video của bạn đã được đăng",
+                                "manage your posts", "administrar tus publicaciones", "quản lý bài viết",
+                                "post another video", "publicar otro video"
+                            ];
+                            return successKws.some(k => txt.includes(k));
+                        }""")
+                        if success_indicator:
+                            publish_confirmed = True
+                            _log("🎉 Nhận được xác nhận xuất bản video thành công từ TikTok Studio!")
+                            break
+
+                    if publish_confirmed:
+                        _log("✅ Đã xuất bản thành công 100% lên TikTok!")
+                        time.sleep(3)
+                        published_video_url = ""
+                        try:
+                            video_links = page.evaluate("""() => {
+                                return Array.from(document.querySelectorAll('a[href*="/video/"]')).map(a => a.href);
+                            }""")
+                            if video_links:
+                                published_video_url = video_links[0]
+                                _log(f"🔗 Bắt được link video TikTok vừa đăng: {published_video_url}")
+                        except Exception as e_lk:
+                            _log(f"⚠️ Chưa trích xuất được link video trực tiếp: {e_lk}")
+                        return {"action": "PUBLISHED", "check_status": check_status, "video_url": published_video_url}
+                    else:
+                        _log("⚠️ Chưa nhận được xác nhận từ TikTok Studio sau khi bấm Đăng.")
+                        return {"action": "FAILED", "check_status": "LỖI: Chưa nhận được xác nhận đăng từ TikTok Studio", "video_url": ""}
                 else:
                     _log("⚠️ Video vẫn dính cảnh báo bản quyền. Tự động chuyển sang Lưu Bản Nháp (Draft) an toàn...")
                     draft_btn = page.locator(
@@ -1528,7 +1845,11 @@ def process_and_upload_local_video(
     source_handle: str = "",
     tiktok_user: str = "",
     source_channel_url: str = "",
-    log_callback = None
+    video_id: str = None,
+    log_callback = None,
+    crop_mode: str = "blur_9_16",
+    series_name: str = "",
+    episode_num: int = 0
 ) -> dict:
     """
     Quy trình xử lý hoàn chỉnh từ file video máy tính:
@@ -1548,7 +1869,8 @@ def process_and_upload_local_video(
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Không tìm thấy file video: {video_path}")
 
-    video_id = f"local_{datetime.now().strftime('%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+    if not video_id:
+        video_id = f"local_{datetime.now().strftime('%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
     clean_title = (title or "").strip().replace("\n", " ")
     clean_desc = (description or "").strip()
 
@@ -1648,6 +1970,7 @@ def process_and_upload_local_video(
         )
         tt_action = tt_res.get("action", "FAILED")
         tt_check_status = tt_res.get("check_status", "LỖI")
+        tt_video_url = tt_res.get("video_url", "")
 
     # 3. Đăng lên YouTube Shorts
     yt_action = "SKIPPED"
@@ -1686,13 +2009,17 @@ def process_and_upload_local_video(
         account_id=account_id,
         source_handle=source_handle,
         tiktok_user=tiktok_user,
-        tiktok_video_url="",
+        tiktok_video_url=tt_video_url,
+        yt_source_url=source_channel_url,
         vpn_region=vpn_region,
         quality_str=quality_str,
         duration=duration,
         check_status="Content Check Lite: HỢP LỆ (XANH)" if tt_action == "PUBLISHED" else tt_check_status,
         posted_date=posted_today_str,
-        channel_id=channel_id
+        channel_id=channel_id,
+        crop_mode=crop_mode,
+        series_name=series_name,
+        episode_num=episode_num
     )
 
     # 5. Gửi thông báo Telegram theo đúng mẫu chuẩn
@@ -1710,7 +2037,8 @@ def process_and_upload_local_video(
                 duration=duration,
                 check_status="Content Check Lite: HỢP LỆ (XANH)",
                 caption_text=tiktok_caption,
-                youtube_url=source_channel_url or yt_video_url or "https://youtube.com"
+                youtube_url=source_channel_url or yt_video_url or "https://youtube.com",
+                tiktok_video_url=tt_video_url
             )
             _log("🎉 Đã gửi thông báo ĐĂNG VIDEO THÀNH CÔNG (TikTok Beta) về Telegram!")
         else:
@@ -1753,9 +2081,9 @@ def is_scanner_running() -> bool:
     global _scanner_running
     return _scanner_running
 
-def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> dict:
+def run_single_channel_download_and_post(channel_id: int, specific_video_url: str = None, log_callback=None) -> dict:
     """
-    Tự động quét tải 1 video mới từ kênh YouTube Shorts nguồn,
+    Tự động quét tải 1 video từ kênh YouTube Shorts nguồn (theo thứ tự cũ nhất hoặc chỉ định),
     xử lý upscale 4K/kiểm tra ≤ 59s, tạo caption/hashtag, và đăng tải sang TikTok.
     """
     def _log(msg):
@@ -1772,22 +2100,48 @@ def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> 
         return {"success": False, "error": "Kênh không tồn tại"}
 
     yt_url = ch.get("youtube_shorts_url", "")
-    if not yt_url:
+    if not yt_url and not specific_video_url:
         return {"success": False, "error": "Kênh chưa cấu hình link YouTube Shorts"}
 
-    _log(f"🔎 Đang quét video mới nhất từ: {yt_url}...")
-    item = fetch_latest_short(yt_url, log_callback=_log)
-    if not item:
-        _log(f"⚠️ Chưa có video Shorts mới đạt chuẩn 1080p/720p hoặc video đang chờ YouTube xử lý từ {yt_url}")
-        return {"success": False, "error": "Không có video mới phù hợp"}
+    if specific_video_url:
+        _log(f"🎯 Kích hoạt xử lý VIDEO CHỈ ĐỊNH: {specific_video_url}...")
+        item = fetch_specific_video(specific_video_url, log_callback=_log)
+        if not item:
+            _log(f"❌ Không thể tải hoặc xử lý video chỉ định: {specific_video_url}")
+            return {"success": False, "error": f"Không thể tải video chỉ định: {specific_video_url}"}
+    else:
+        order_mode = (ch.get("order_mode") or "oldest_first").lower()
+        mode_label = "Từ cũ nhất" if order_mode == "oldest_first" else "Từ mới nhất"
+        _log(f"🔎 Đang quét video từ: {yt_url} (Chế độ: {mode_label})...")
+        item = fetch_channel_short(yt_url, order_mode=order_mode, log_callback=_log)
+        if not item:
+            _log(f"⚠️ Chưa có video Shorts phù hợp hoặc đã đăng hết từ {yt_url}")
+            return {"success": False, "error": "Không có video mới phù hợp"}
 
-    _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Tiến hành render lách bản quyền...")
+    crop_mode = ch.get("crop_mode", "blur_9_16") or "blur_9_16"
+    _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Chế độ cắt: {crop_mode}. Tiến hành render lách bản quyền...")
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
     out_remix = os.path.join(dl_dir, f"{item['video_id']}_remix.mp4")
-    stats = edit_and_upscale_4k(item["raw_path"], out_remix, log_callback=_log)
+    stats = edit_and_upscale_4k(
+        item["raw_path"], 
+        out_remix, 
+        log_callback=_log,
+        crop_mode=crop_mode,
+        fake_mobile_camera=True
+    )
     final_video_path = stats.get("file_path", out_remix)
 
+    # Xử lý chuỗi Series / Tập nếu kênh có thiết lập series_name
+    series_name = (ch.get("series_name") or "").strip()
+    episode_num = 0
+    if series_name:
+        try:
+            from series_manager import get_next_episode_number
+            episode_num = get_next_episode_number(series_name, ch.get("id", 0))
+            _log(f"🎬 Kênh theo chuỗi Series: '{series_name}' - Đang gán Tập {episode_num} (#Part{episode_num})")
+        except Exception as e:
+            _log(f"⚠️ Không thể gán tập series: {e}")
 
     # Sinh caption & hashtag theo chế độ kênh (Giữ gốc / AI viết lại, tự dùng AI nếu thiếu tiêu đề hoặc mô tả gốc)
     vpn_region = ch.get("vpn_region", "VN")
@@ -1803,6 +2157,14 @@ def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> 
     title = seo_meta.get("title", item.get("title", ""))
     desc = seo_meta.get("description", "")
     tags = seo_meta.get("hashtags", [])
+
+    if series_name and episode_num > 0:
+        try:
+            from series_manager import build_series_caption
+            tags_str = " ".join([t.lower() if t.startswith("#") else f"#{t.lower()}" for t in tags])
+            title = build_series_caption(title, series_name, episode_num, tags_str)
+        except Exception as e:
+            _log(f"⚠️ Lỗi định dạng series caption: {e}")
 
     profile_data = {
         "name": ch.get("profile_name", "AutoProfile"),
@@ -1828,7 +2190,11 @@ def run_single_channel_download_and_post(channel_id: int, log_callback=None) -> 
         source_handle=ch.get("source_handle", ""),
         tiktok_user=ch.get("tiktok_user", ""),
         source_channel_url=item.get("url", yt_url),
-        log_callback=log_callback
+        video_id=item.get("video_id"),
+        log_callback=log_callback,
+        crop_mode=crop_mode,
+        series_name=series_name,
+        episode_num=episode_num
     )
     return {"success": True, "details": res}
 
@@ -1944,6 +2310,108 @@ def audit_daily_videos(target_date: str = None, log_callback=None) -> dict:
         "total": len(rows)
     }
 
+def get_channel_latest_post_time_today(channel_id: int, target_date: str = None) -> datetime | None:
+    """Lấy mốc thời gian đăng video thành công gần nhất trong ngày của kênh."""
+    if not target_date:
+        target_date = datetime.now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT created_at FROM videos 
+        WHERE (channel_id = ? OR profile_name IN (SELECT profile_name FROM channels WHERE id = ?))
+          AND posted_date = ? AND status = 'PUBLISHED'
+        ORDER BY created_at DESC LIMIT 1
+    """, (channel_id, channel_id, target_date))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        try:
+            return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return None
+
+def get_jittered_post_time(base_time_str: str, channel_id: int, max_jitter: int = 10) -> str:
+    """
+    Tạo độ lệch thời gian ngẫu nhiên (Jitter) chống thuật toán TikTok nhận diện bot đăng định kỳ.
+    Độ lệch được sinh ngẫu nhiên nhưng đồng nhất trong ngày theo channel_id để lịch không bị giật lùi.
+    """
+    try:
+        from datetime import timedelta
+        import hashlib
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        seed_str = f"{today_str}_{channel_id}_{base_time_str}"
+        h = int(hashlib.md5(seed_str.encode()).hexdigest()[:6], 16)
+        offset_minutes = (h % (max_jitter * 2 + 1)) - max_jitter
+        t = datetime.strptime(base_time_str, "%H:%M") + timedelta(minutes=offset_minutes)
+        return t.strftime("%H:%M")
+    except Exception:
+        return base_time_str
+
+def get_golden_hours_presets():
+    """Khung giờ vàng chuẩn TikTok (Dựa trên hàng triệu lượt xem thực tế từ JL Tool)"""
+    return {
+        "morning": {"name": "🌅 Khung Giờ Sáng (Đi làm / Ăn sáng)", "range": "06:30 - 08:30", "default": "07:15"},
+        "noon": {"name": "☀️ Khung Giờ Trưa (Nghỉ trưa / Ăn trưa)", "range": "11:30 - 13:30", "default": "12:15"},
+        "evening": {"name": "🌙 Khung Giờ Vàng Tối (Giải trí cao điểm)", "range": "18:30 - 21:30", "default": "19:45"}
+    }
+
+def is_channel_due_for_post(channel_id: int, daily_target: int = 2) -> tuple[bool, str]:
+    """
+    Kiểm tra xem kênh có đến lượt đăng tự động theo lịch hay không:
+    - Target: 2 video/ngày (hoặc theo cấu hình riêng từng kênh).
+    - Hỗ trợ Jitter chống bot định kỳ: Tự động lệch ngẫu nhiên +-10 phút mỗi ngày.
+    - Slot 1: morning_time + Jitter
+    - Slot 2: evening_time + Jitter (cách slot 1 tối thiểu min_interval_hours)
+    """
+    posted_today = get_channel_posted_count_today(channel_id)
+    if posted_today >= daily_target:
+        return False, f"Đã đạt chỉ tiêu ngày hôm nay ({posted_today}/{daily_target} video)"
+
+    cfg = load_config()
+    morning_time_str = str(cfg.get("schedule_morning_time", "07:15")).strip() or "07:15"
+    evening_time_str = str(cfg.get("schedule_evening_time", "19:45")).strip() or "19:45"
+    enable_jitter = cfg.get("enable_schedule_jitter", True)
+    jitter_mins = int(cfg.get("schedule_jitter_minutes", 10))
+
+    if enable_jitter:
+        morning_target = get_jittered_post_time(morning_time_str, channel_id, jitter_mins)
+        evening_target = get_jittered_post_time(evening_time_str, channel_id, jitter_mins)
+    else:
+        morning_target = morning_time_str
+        evening_target = evening_time_str
+
+    try:
+        min_interval_hours = float(cfg.get("min_post_interval_hours", 4))
+    except Exception:
+        min_interval_hours = 4.0
+
+    now = datetime.now()
+    now_hm = now.strftime("%H:%M")
+    latest_time = get_channel_latest_post_time_today(channel_id)
+
+    if posted_today == 0:
+        # Cần đăng Video Buổi Sáng
+        if now_hm < morning_target:
+            return False, f"Chưa đến khung giờ đăng Buổi Sáng (Hiện tại: {now_hm} < Lịch Jitter: {morning_target})"
+        return True, f"Đủ điều kiện đăng Slot 1 (Khung Sáng Jitter {morning_target})"
+    elif posted_today == 1:
+        # Cần đăng Video Buổi Tối
+        if now_hm < evening_target:
+            return False, f"Chưa đến khung giờ đăng Buổi Tối (Hiện tại: {now_hm} < Lịch Jitter: {evening_target})"
+        if latest_time:
+            diff_hours = (now - latest_time).total_seconds() / 3600.0
+            if diff_hours < min_interval_hours:
+                return False, f"Chưa đủ giãn cách an toàn ({diff_hours:.1f}h < {min_interval_hours}h so với video buổi sáng)"
+        return True, f"Đủ điều kiện đăng Slot 2 (Khung Tối Jitter {evening_target})"
+    else:
+        # Trường hợp daily_target > 2
+        if latest_time:
+            diff_hours = (now - latest_time).total_seconds() / 3600.0
+            if diff_hours < min_interval_hours:
+                return False, f"Chưa đủ giãn cách an toàn ({diff_hours:.1f}h < {min_interval_hours}h)"
+        return True, f"Đủ điều kiện đăng Video #{posted_today + 1}"
+
 def start_auto_scanner(log_callback=None):
     global _scanner_running, _scanner_thread
     if _scanner_running:
@@ -1959,12 +2427,14 @@ def start_auto_scanner(log_callback=None):
                 except Exception:
                     pass
 
-        _log("🚀 Khởi động dịch vụ tự động quét kênh YouTube Shorts...")
+        cfg = load_config()
+        m_t = cfg.get("schedule_morning_time", "09:00")
+        e_t = cfg.get("schedule_evening_time", "19:00")
+        _log(f"🚀 Khởi động dịch vụ tự động quét & đăng bài (Lịch trình: 1 Sáng [{m_t}] - 1 Tối [{e_t}])...")
         while _scanner_running:
             channels = get_all_channels()
             if not channels:
-                _log("ℹ️ Chưa có kênh nào trong danh sách theo dõi. Chờ 60s...")
-                for _ in range(60):
+                for _ in range(30):
                     if not _scanner_running:
                         break
                     time.sleep(1)
@@ -1979,8 +2449,8 @@ def start_auto_scanner(log_callback=None):
                     continue
 
                 daily_target = ch.get("daily_target", 2) or 2
-                posted_today = get_channel_posted_count_today(ch["id"])
-                if posted_today >= daily_target:
+                is_due, reason = is_channel_due_for_post(ch["id"], daily_target)
+                if not is_due:
                     continue
 
                 yt_url = ch.get("youtube_shorts_url", "")
@@ -1988,15 +2458,15 @@ def start_auto_scanner(log_callback=None):
                     continue
 
                 try:
-                    _log(f"🔎 Quét kênh '{ch.get('source_handle')}' (Đã đăng: {posted_today}/{daily_target})...")
+                    posted_count = get_channel_posted_count_today(ch["id"])
+                    slot_name = "Buổi Sáng" if posted_count == 0 else "Buổi Tối"
+                    _log(f"⏰ Kích hoạt đăng video [{slot_name}] cho kênh '{ch.get('source_handle')}' ({posted_count + 1}/{daily_target})...")
                     run_single_channel_download_and_post(ch["id"], log_callback=log_callback)
                 except Exception as e:
-                    _log(f"❌ Lỗi khi quét kênh {yt_url}: {e}")
+                    _log(f"❌ Lỗi khi đăng kênh {yt_url}: {e}")
 
-            cfg = load_config()
-            interval = cfg.get("scan_interval_seconds", 600)
-            _log(f"💤 Nghỉ {interval} giây trước lượt quét kế tiếp...")
-            for _ in range(interval):
+            # Quét kiểm tra mỗi 60s
+            for _ in range(60):
                 if not _scanner_running:
                     break
                 time.sleep(1)

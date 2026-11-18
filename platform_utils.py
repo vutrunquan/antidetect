@@ -95,6 +95,41 @@ def detect_best_video_encoder() -> list[str]:
 
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
+_CAFFEINATE_PROC = None
+
+def set_keep_awake(enable: bool = True):
+    """
+    Chống hệ điều hành rơi vào trạng thái Sleep/Standby khi chạy lịch đăng ngầm.
+    - macOS: Chạy ngầm 'caffeinate' giữ máy thức.
+    - Windows: Gọi API kernel32 SetThreadExecutionState.
+    """
+    global _CAFFEINATE_PROC
+    try:
+        if IS_WIN:
+            import ctypes
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_AWAYMODE_REQUIRED = 0x00000040
+            if enable:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
+            else:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        elif IS_MAC:
+            if enable:
+                if _CAFFEINATE_PROC is None or _CAFFEINATE_PROC.poll() is not None:
+                    _CAFFEINATE_PROC = subprocess.Popen(
+                        ["caffeinate", "-d", "-i", "-m", "-u"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+            else:
+                if _CAFFEINATE_PROC and _CAFFEINATE_PROC.poll() is None:
+                    _CAFFEINATE_PROC.terminate()
+                    _CAFFEINATE_PROC = None
+        return enable
+    except Exception:
+        return False
+
 def load_config() -> dict:
     default_cfg = {
         "telegram_bot_token": "",

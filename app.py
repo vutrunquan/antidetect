@@ -22,9 +22,12 @@ import requests
 
 from profile_manager import ProfileManager
 from browser_runner import parse_proxy
-from platform_utils import BASE_DIR, load_config, save_config
+from platform_utils import BASE_DIR, load_config, save_config, set_keep_awake
 from ai_seo_helper import generate_seo_metadata, clean_filename_to_title
 import post_manager
+import video_remix_engine
+import channel_auditor
+import series_manager
 
 class Api:
     def __init__(self):
@@ -510,12 +513,53 @@ class Api:
                 daily_target=int(data.get("daily_target", 2)),
                 status=data.get("status", "ACTIVE"),
                 title_mode=data.get("title_mode", "ai_rewrite"),
-                order_mode=data.get("order_mode", "oldest_first")
+                order_mode=data.get("order_mode", "oldest_first"),
+                crop_mode=data.get("crop_mode", "blur_9_16"),
+                series_name=data.get("series_name", "").strip()
             )
             self.log(f"➕ Đã thêm kênh TikTok Beta: {data.get('youtube_shorts_url')}")
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    def get_crop_options(self):
+        try:
+            return video_remix_engine.get_crop_options()
+        except Exception as e:
+            return {"blur_9_16": "Thêm nền mờ 9:16 (Chuẩn TikTok Shorts)", "crop_9_16": "Cắt trung tâm 9:16", "original": "Giữ nguyên tỷ lệ gốc"}
+
+    def get_golden_hours_presets(self):
+        try:
+            return post_manager.get_golden_hours_presets()
+        except Exception:
+            return {}
+
+    def get_all_series(self, channel_id=None):
+        try:
+            cid = int(channel_id) if channel_id else None
+            return series_manager.get_all_series(channel_id=cid)
+        except Exception as e:
+            return []
+
+    def audit_channel(self, channel_id):
+        def _task():
+            self.log(f"🩺 Bắt đầu khám sức khỏe & Shadowban cho kênh #{channel_id}...")
+            res = channel_auditor.audit_channel_health(int(channel_id), log_callback=self.log)
+            if res.get("success"):
+                score = res.get("health_score", 0)
+                status = res.get("health_status", "UNKNOWN")
+                self.log(f"🩺 Khám kênh #{channel_id} hoàn tất! Điểm: {score}/100 - Trạng thái: {status}")
+            else:
+                self.log(f"❌ Khám kênh #{channel_id} thất bại: {res.get('error')}")
+
+        threading.Thread(target=_task, daemon=True).start()
+        return {"ok": True, "msg": "Đang mở trình duyệt kiểm tra video & khám kênh..."}
+
+    def set_keep_awake(self, enable=True):
+        res = set_keep_awake(bool(enable))
+        status_text = "BẬT (Không tắt màn hình/sleep)" if enable else "TẮT (Chế độ bình thường)"
+        self.log(f"⚡️ Chế độ Treo Máy Đêm: {status_text}")
+        return {"ok": True, "active": res}
 
     def toggle_channel_status(self, channel_id, new_status):
         try:

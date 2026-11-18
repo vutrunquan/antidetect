@@ -139,6 +139,12 @@ def init_db():
         ("status", "TEXT DEFAULT 'ACTIVE'"),
         ("title_mode", "TEXT DEFAULT 'ai_rewrite'"),
         ("order_mode", "TEXT DEFAULT 'oldest_first'"),
+        ("crop_mode", "TEXT DEFAULT 'blur_9_16'"),
+        ("series_name", "TEXT DEFAULT ''"),
+        ("jitter_enabled", "INTEGER DEFAULT 1"),
+        ("health_score", "INTEGER DEFAULT 85"),
+        ("health_status", "TEXT DEFAULT 'healthy'"),
+        ("last_audit_time", "TEXT DEFAULT ''"),
         ("post_to_tiktok", "INTEGER DEFAULT 1"),
         ("post_to_youtube", "INTEGER DEFAULT 1"),
         ("created_at", "TEXT DEFAULT ''")
@@ -157,6 +163,9 @@ def init_db():
         ("tiktok_video_url", "TEXT DEFAULT ''"),
         ("yt_source_url", "TEXT DEFAULT ''"),
         ("vpn_region", "TEXT DEFAULT ''"),
+        ("crop_mode", "TEXT DEFAULT 'original'"),
+        ("series_name", "TEXT DEFAULT ''"),
+        ("episode_num", "INTEGER DEFAULT 0"),
         ("quality_str", "TEXT DEFAULT ''"),
         ("duration", "REAL DEFAULT 0.0"),
         ("check_status", "TEXT DEFAULT ''"),
@@ -203,7 +212,8 @@ def save_video_record(
     account_id="", source_handle="", tiktok_user="", tiktok_video_url="",
     yt_source_url="",
     vpn_region="VN", quality_str="", duration=0.0, check_status="",
-    posted_date=None, channel_id=0
+    posted_date=None, channel_id=0,
+    crop_mode="blur_9_16", series_name="", episode_num=0
 ):
     conn = sqlite3.connect(DB_PATH)
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -212,10 +222,12 @@ def save_video_record(
     conn.execute("""
     INSERT OR REPLACE INTO videos 
     (video_id, profile_name, profile_dir, proxy_server, shorts_title, local_4k_path, caption, status, yt_status, yt_video_url, created_at,
-     account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id,
+     crop_mode, series_name, episode_num)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (video_id, profile_name, profile_dir, proxy_server, shorts_title, local_4k_path, caption, status, yt_status, yt_video_url, created_at,
-          account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id))
+          account_id, source_handle, tiktok_user, tiktok_video_url, yt_source_url, vpn_region, quality_str, duration, check_status, posted_date, channel_id,
+          crop_mode, series_name, episode_num))
     conn.commit()
     conn.close()
 
@@ -269,7 +281,9 @@ def add_tracked_channel(
     daily_target: int = 2,
     status: str = "ACTIVE",
     title_mode: str = "ai_rewrite",
-    order_mode: str = "oldest_first"
+    order_mode: str = "oldest_first",
+    crop_mode: str = "blur_9_16",
+    series_name: str = ""
 ):
     norm_url, parsed_handle = parse_youtube_channel_input(yt_url)
     if not source_handle:
@@ -278,6 +292,7 @@ def add_tracked_channel(
         account_id = generate_account_id()
     norm_title_mode = "keep_original" if str(title_mode).strip().lower() == "keep_original" else "ai_rewrite"
     norm_order_mode = "newest_first" if str(order_mode).strip().lower() == "newest_first" else "oldest_first"
+    norm_crop_mode = str(crop_mode).strip() if crop_mode else "blur_9_16"
 
     if not profile_dir:
         profile_dir = os.path.join(BASE_DIR, "profiles", profile_name.replace(" ", "_"))
@@ -287,10 +302,10 @@ def add_tracked_channel(
     conn.execute("""
     INSERT OR REPLACE INTO channels 
     (youtube_shorts_url, tiktok_user, vpn_region, profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-     account_id, source_handle, daily_target, status, title_mode, order_mode)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     account_id, source_handle, daily_target, status, title_mode, order_mode, crop_mode, series_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (norm_url, tiktok_user, vpn_region.upper(), profile_name, profile_dir, proxy_server, niche, post_to_tiktok, post_to_youtube, created_at,
-          account_id, source_handle, daily_target, status.upper(), norm_title_mode, norm_order_mode))
+          account_id, source_handle, daily_target, status.upper(), norm_title_mode, norm_order_mode, norm_crop_mode, series_name.strip()))
     conn.commit()
     conn.close()
 
@@ -330,7 +345,7 @@ def update_channel_details(channel_id: int, data: dict):
     conn = sqlite3.connect(DB_PATH)
     fields = []
     vals = []
-    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "title_mode", "order_mode", "post_to_tiktok", "post_to_youtube"]:
+    for k in ["account_id", "source_handle", "youtube_shorts_url", "tiktok_user", "vpn_region", "profile_name", "niche", "daily_target", "status", "title_mode", "order_mode", "post_to_tiktok", "post_to_youtube", "crop_mode", "series_name", "jitter_enabled"]:
         if k in data:
             fields.append(f"{k} = ?")
             vals.append(data[k])
@@ -525,20 +540,23 @@ def verify_downloaded_file_quality(file_path: str, return_fps: bool = False):
         return False, 0, 0, err_lbl
 
 
-def edit_and_upscale_4k(raw_path: str, output_path: str, log_callback=None) -> dict:
+def edit_and_upscale_4k(raw_path: str, output_path: str, crop_mode: str = "blur_9_16", fake_mobile_camera: bool = True, log_callback=None) -> dict:
     """
     Video Remix Engine (FFmpeg Pipeline):
     1. Zoom nhẹ 1.03x + crop trung tâm để đổi toàn bộ tọa độ pixel và mã băm hash frame.
-    2. Bộ lọc unsharp (làm nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
-    3. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x để lách Content ID nhưng giữ nguyên độ dài.
-    4. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1).
-    5. Hỗ trợ toàn bộ độ dài video (không cắt giới hạn 59s).
+    2. Cắt chuyển đổi khung hình linh hoạt (original, blur_9_16 nền mờ nghệ thuật, crop_9_16, crop_1_1).
+    3. Bộ lọc unsharp (làm nét) + tương phản contrast 1.02, bão hòa saturation 1.04.
+    4. Bộ lọc âm thanh asetrate/atempo: đổi nhẹ dải tần 1.025x để lách Content ID nhưng giữ nguyên độ dài.
+    5. Xóa sạch toàn bộ Metadata gốc (-map_metadata -1) và chèn Metadata Camera Điện Thoại Thật (iPhone 15 Pro Max/S23 Ultra) để lách quét 0-view.
+    6. Hỗ trợ toàn bộ độ dài video (không cắt giới hạn 59s).
     """
     rendered_path = render_anti_copyright_video(
         input_path=raw_path,
         output_path=output_path,
         zoom_ratio=1.03,
         enable_audio_mod=True,
+        crop_mode=crop_mode,
+        fake_mobile_camera=fake_mobile_camera,
         log_callback=log_callback
     )
 
@@ -851,7 +869,7 @@ def dismiss_tiktok_popups(page, logger=None):
             try: logger(msg)
             except Exception: pass
 
-    # 1. Bấm xác nhận các modal yêu cầu bật tính năng (VD: 'Turn on automatic content checks?')
+    # 1. Bấm xác nhận các modal yêu cầu bật tính năng hoặc bỏ qua bản nháp
     for btn_kw in [
         'button:has-text("Turn on")',
         'button:has-text("Activar")',
@@ -859,6 +877,13 @@ def dismiss_tiktok_popups(page, logger=None):
         'button:has-text("Confirm")',
         'button:has-text("Confirmar")',
         'button:has-text("Xác nhận")',
+        'button:has-text("Discard")',
+        'button:has-text("Hủy bỏ")',
+        'button:has-text("Loại bỏ")',
+        'button:has-text("Bỏ bản nháp")',
+        'button:has-text("Post anyway")',
+        'button:has-text("Đăng ngay")',
+        'button:has-text("Tiếp tục đăng")',
         'button:has-text("Got it")',
         'button:has-text("Entendido")',
         'button:has-text("Đã hiểu")',
@@ -878,6 +903,20 @@ def dismiss_tiktok_popups(page, logger=None):
                 time.sleep(0.5)
         except Exception:
             pass
+
+    # 1.1 Quét JS thông minh các button xử lý nhanh (Discard unsaved draft / Turn on checks / Post anyway)
+    try:
+        page.evaluate("""() => {
+            const buttons = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"]'));
+            for (const b of buttons) {
+                const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+                if (['discard', 'hủy bỏ', 'loại bỏ', 'bỏ bản nháp', 'post anyway', 'đăng ngay', 'tiếp tục đăng'].includes(text)) {
+                    b.click();
+                }
+            }
+        }""")
+    except Exception:
+        pass
 
     # 2. Xóa sạch overlay DOM nếu vẫn còn sót chắn chuột
     try:
@@ -1807,7 +1846,10 @@ def process_and_upload_local_video(
     tiktok_user: str = "",
     source_channel_url: str = "",
     video_id: str = None,
-    log_callback = None
+    log_callback = None,
+    crop_mode: str = "blur_9_16",
+    series_name: str = "",
+    episode_num: int = 0
 ) -> dict:
     """
     Quy trình xử lý hoàn chỉnh từ file video máy tính:
@@ -1974,7 +2016,10 @@ def process_and_upload_local_video(
         duration=duration,
         check_status="Content Check Lite: HỢP LỆ (XANH)" if tt_action == "PUBLISHED" else tt_check_status,
         posted_date=posted_today_str,
-        channel_id=channel_id
+        channel_id=channel_id,
+        crop_mode=crop_mode,
+        series_name=series_name,
+        episode_num=episode_num
     )
 
     # 5. Gửi thông báo Telegram theo đúng mẫu chuẩn
@@ -2073,12 +2118,30 @@ def run_single_channel_download_and_post(channel_id: int, specific_video_url: st
             _log(f"⚠️ Chưa có video Shorts phù hợp hoặc đã đăng hết từ {yt_url}")
             return {"success": False, "error": "Không có video mới phù hợp"}
 
-    _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Tiến hành render lách bản quyền...")
+    crop_mode = ch.get("crop_mode", "blur_9_16") or "blur_9_16"
+    _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Chế độ cắt: {crop_mode}. Tiến hành render lách bản quyền...")
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
     out_remix = os.path.join(dl_dir, f"{item['video_id']}_remix.mp4")
-    stats = edit_and_upscale_4k(item["raw_path"], out_remix, log_callback=_log)
+    stats = edit_and_upscale_4k(
+        item["raw_path"], 
+        out_remix, 
+        log_callback=_log,
+        crop_mode=crop_mode,
+        fake_mobile_camera=True
+    )
     final_video_path = stats.get("file_path", out_remix)
+
+    # Xử lý chuỗi Series / Tập nếu kênh có thiết lập series_name
+    series_name = (ch.get("series_name") or "").strip()
+    episode_num = 0
+    if series_name:
+        try:
+            from series_manager import get_next_episode_number
+            episode_num = get_next_episode_number(series_name, ch.get("id", 0))
+            _log(f"🎬 Kênh theo chuỗi Series: '{series_name}' - Đang gán Tập {episode_num} (#Part{episode_num})")
+        except Exception as e:
+            _log(f"⚠️ Không thể gán tập series: {e}")
 
     # Sinh caption & hashtag theo chế độ kênh (Giữ gốc / AI viết lại, tự dùng AI nếu thiếu tiêu đề hoặc mô tả gốc)
     vpn_region = ch.get("vpn_region", "VN")
@@ -2094,6 +2157,14 @@ def run_single_channel_download_and_post(channel_id: int, specific_video_url: st
     title = seo_meta.get("title", item.get("title", ""))
     desc = seo_meta.get("description", "")
     tags = seo_meta.get("hashtags", [])
+
+    if series_name and episode_num > 0:
+        try:
+            from series_manager import build_series_caption
+            tags_str = " ".join([t.lower() if t.startswith("#") else f"#{t.lower()}" for t in tags])
+            title = build_series_caption(title, series_name, episode_num, tags_str)
+        except Exception as e:
+            _log(f"⚠️ Lỗi định dạng series caption: {e}")
 
     profile_data = {
         "name": ch.get("profile_name", "AutoProfile"),
@@ -2120,7 +2191,10 @@ def run_single_channel_download_and_post(channel_id: int, specific_video_url: st
         tiktok_user=ch.get("tiktok_user", ""),
         source_channel_url=item.get("url", yt_url),
         video_id=item.get("video_id"),
-        log_callback=log_callback
+        log_callback=log_callback,
+        crop_mode=crop_mode,
+        series_name=series_name,
+        episode_num=episode_num
     )
     return {"success": True, "details": res}
 
@@ -2257,20 +2331,56 @@ def get_channel_latest_post_time_today(channel_id: int, target_date: str = None)
             pass
     return None
 
+def get_jittered_post_time(base_time_str: str, channel_id: int, max_jitter: int = 10) -> str:
+    """
+    Tạo độ lệch thời gian ngẫu nhiên (Jitter) chống thuật toán TikTok nhận diện bot đăng định kỳ.
+    Độ lệch được sinh ngẫu nhiên nhưng đồng nhất trong ngày theo channel_id để lịch không bị giật lùi.
+    """
+    try:
+        from datetime import timedelta
+        import hashlib
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        seed_str = f"{today_str}_{channel_id}_{base_time_str}"
+        h = int(hashlib.md5(seed_str.encode()).hexdigest()[:6], 16)
+        offset_minutes = (h % (max_jitter * 2 + 1)) - max_jitter
+        t = datetime.strptime(base_time_str, "%H:%M") + timedelta(minutes=offset_minutes)
+        return t.strftime("%H:%M")
+    except Exception:
+        return base_time_str
+
+def get_golden_hours_presets():
+    """Khung giờ vàng chuẩn TikTok (Dựa trên hàng triệu lượt xem thực tế từ JL Tool)"""
+    return {
+        "morning": {"name": "🌅 Khung Giờ Sáng (Đi làm / Ăn sáng)", "range": "06:30 - 08:30", "default": "07:15"},
+        "noon": {"name": "☀️ Khung Giờ Trưa (Nghỉ trưa / Ăn trưa)", "range": "11:30 - 13:30", "default": "12:15"},
+        "evening": {"name": "🌙 Khung Giờ Vàng Tối (Giải trí cao điểm)", "range": "18:30 - 21:30", "default": "19:45"}
+    }
+
 def is_channel_due_for_post(channel_id: int, daily_target: int = 2) -> tuple[bool, str]:
     """
-    Kiểm tra xem kênh có đến lượt đăng tự động theo lịch (1 SÁNG, 1 TỐI) hay không:
-    - Target: 2 video/ngày.
-    - Slot 1 (Buổi Sáng): từ schedule_morning_time (mặc định 09:00).
-    - Slot 2 (Buổi Tối): từ schedule_evening_time (mặc định 19:00) VÀ cách slot sáng tối thiểu min_post_interval_hours (mặc định 4h).
+    Kiểm tra xem kênh có đến lượt đăng tự động theo lịch hay không:
+    - Target: 2 video/ngày (hoặc theo cấu hình riêng từng kênh).
+    - Hỗ trợ Jitter chống bot định kỳ: Tự động lệch ngẫu nhiên +-10 phút mỗi ngày.
+    - Slot 1: morning_time + Jitter
+    - Slot 2: evening_time + Jitter (cách slot 1 tối thiểu min_interval_hours)
     """
     posted_today = get_channel_posted_count_today(channel_id)
     if posted_today >= daily_target:
         return False, f"Đã đạt chỉ tiêu ngày hôm nay ({posted_today}/{daily_target} video)"
 
     cfg = load_config()
-    morning_time_str = str(cfg.get("schedule_morning_time", "09:00")).strip() or "09:00"
-    evening_time_str = str(cfg.get("schedule_evening_time", "19:00")).strip() or "19:00"
+    morning_time_str = str(cfg.get("schedule_morning_time", "07:15")).strip() or "07:15"
+    evening_time_str = str(cfg.get("schedule_evening_time", "19:45")).strip() or "19:45"
+    enable_jitter = cfg.get("enable_schedule_jitter", True)
+    jitter_mins = int(cfg.get("schedule_jitter_minutes", 10))
+
+    if enable_jitter:
+        morning_target = get_jittered_post_time(morning_time_str, channel_id, jitter_mins)
+        evening_target = get_jittered_post_time(evening_time_str, channel_id, jitter_mins)
+    else:
+        morning_target = morning_time_str
+        evening_target = evening_time_str
+
     try:
         min_interval_hours = float(cfg.get("min_post_interval_hours", 4))
     except Exception:
@@ -2282,18 +2392,18 @@ def is_channel_due_for_post(channel_id: int, daily_target: int = 2) -> tuple[boo
 
     if posted_today == 0:
         # Cần đăng Video Buổi Sáng
-        if now_hm < morning_time_str:
-            return False, f"Chưa đến khung giờ đăng Buổi Sáng ({now_hm} < {morning_time_str})"
-        return True, "Đủ điều kiện đăng Slot 1 (Buổi Sáng)"
+        if now_hm < morning_target:
+            return False, f"Chưa đến khung giờ đăng Buổi Sáng (Hiện tại: {now_hm} < Lịch Jitter: {morning_target})"
+        return True, f"Đủ điều kiện đăng Slot 1 (Khung Sáng Jitter {morning_target})"
     elif posted_today == 1:
         # Cần đăng Video Buổi Tối
-        if now_hm < evening_time_str:
-            return False, f"Chưa đến khung giờ đăng Buổi Tối ({now_hm} < {evening_time_str})"
+        if now_hm < evening_target:
+            return False, f"Chưa đến khung giờ đăng Buổi Tối (Hiện tại: {now_hm} < Lịch Jitter: {evening_target})"
         if latest_time:
             diff_hours = (now - latest_time).total_seconds() / 3600.0
             if diff_hours < min_interval_hours:
                 return False, f"Chưa đủ giãn cách an toàn ({diff_hours:.1f}h < {min_interval_hours}h so với video buổi sáng)"
-        return True, "Đủ điều kiện đăng Slot 2 (Buổi Tối)"
+        return True, f"Đủ điều kiện đăng Slot 2 (Khung Tối Jitter {evening_target})"
     else:
         # Trường hợp daily_target > 2
         if latest_time:
