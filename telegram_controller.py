@@ -59,7 +59,8 @@ def send_tiktok_beta_success_report(
     duration: float,
     check_status: str,
     caption_text: str,
-    youtube_url: str
+    youtube_url: str,
+    tiktok_video_url: str = ""
 ):
     """
     Gửi thông báo ĐĂNG VIDEO THÀNH CÔNG theo đúng mẫu quy chuẩn:
@@ -84,6 +85,8 @@ def send_tiktok_beta_success_report(
     safe_check = html.escape(str(check_status or "").split("\n")[0].strip())
     safe_caption = html.escape(str(caption_text or ""))
 
+    tiktok_link_line = f"🎵 <b>Link video TikTok:</b> <a href=\"{tiktok_video_url}\">{tiktok_video_url}</a>\n" if tiktok_video_url else ""
+
     msg = (
         f"🎉 <b>[TIKTOK BETA] ĐĂNG VIDEO THÀNH CÔNG!</b>\n\n"
         f"👤 <b>Kênh nhận:</b> {safe_channel} ({safe_acc})\n"
@@ -97,10 +100,13 @@ def send_tiktok_beta_success_report(
         f"⏰ <b>Thời gian đăng:</b> {now_str}\n\n"
         f"📝 <b>Caption đăng tải:</b>\n"
         f"<blockquote>{safe_caption}</blockquote>\n\n"
+        f"{tiktok_link_line}"
         f"🔗 <a href=\"{youtube_url}\">Xem video gốc trên YouTube</a>\n\n"
         f"🤖 <i>Thông báo tự động từ Hệ thống Nuôi Kênh TikTok Beta</i>"
     )
     markup = InlineKeyboardMarkup()
+    if tiktok_video_url:
+        markup.add(InlineKeyboardButton("🎵 Xem video trên TikTok", url=tiktok_video_url))
     if youtube_url:
         markup.add(InlineKeyboardButton("🔗 Xem video gốc trên YouTube", url=youtube_url))
     try:
@@ -414,11 +420,44 @@ def _register_handlers(bot: telebot.TeleBot):
         bot.reply_to(
             message,
             "🤖 <b>Chào mừng bạn đến với Hệ thống Auto Đăng Bài Camoufox Antidetect!</b>\n\n"
+            "📅 <b>Lịch trình:</b> 2 video/ngày (1 Buổi Sáng, 1 Buổi Tối, tự tịnh tiến từ video cũ nhất sang mới)\n\n"
             "Các lệnh hỗ trợ:\n"
             "• /channels - Xem danh sách các kênh đang theo dõi\n"
-            "• /status - Xem trạng thái hệ thống\n"
+            "• /post [id] [link_yt] - Đăng một video YouTube chỉ định ngay lập tức\n"
+            "• /bu1 - Đăng bù 1 video cho các kênh đang thiếu\n"
+            "• /duyet - Đăng bù đủ toàn bộ chỉ tiêu cho mọi kênh\n"
+            "• /kpi - Báo cáo tiến độ chỉ tiêu trong ngày\n"
+            "• /kiemdinh - Kiểm định Views, Likes, Shadowban, Trùng lặp\n"
             "• /add [thông tin kênh] - Thêm kênh quét tự động\n"
         )
+
+    @bot.message_handler(commands=['post'])
+    def cmd_post_custom(message):
+        text = message.text.replace("/post", "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            bot.reply_to(message, "❌ Cú pháp: <code>/post [ID_kênh_hoặc_Profile] [Link_YouTube]</code>\n<i>Ví dụ:</i> <code>/post fr6 https://youtube.com/shorts/OLs-InoExc4</code>")
+            return
+        target_ref, yt_vid_url = parts[0].strip(), parts[1].strip()
+        channels = get_all_channels()
+        found_ch = None
+        for ch in channels:
+            if str(ch["id"]) == target_ref or ch.get("profile_name", "").lower() == target_ref.lower():
+                found_ch = ch
+                break
+        if not found_ch:
+            bot.reply_to(message, f"❌ Không tìm thấy kênh nào khớp với '{target_ref}'. Gõ /channels để xem danh sách.")
+            return
+
+        bot.reply_to(message, f"⏳ <b>Đang tải và đăng video tùy chọn cho kênh {found_ch.get('profile_name')}:</b>\n🔗 {yt_vid_url}")
+        def _task():
+            from post_manager import run_single_channel_download_and_post
+            res = run_single_channel_download_and_post(found_ch["id"], specific_video_url=yt_vid_url)
+            if res.get("success"):
+                bot.send_message(message.chat.id, f"✅ <b>Đã đăng thành công video tùy chọn cho kênh {found_ch.get('profile_name')}!</b>")
+            else:
+                bot.send_message(message.chat.id, f"❌ <b>Đăng thất bại:</b> {res.get('error')}")
+        threading.Thread(target=_task, daemon=True).start()
 
     @bot.message_handler(commands=['bu1'])
     def cmd_bu1(message):

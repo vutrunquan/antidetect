@@ -614,7 +614,8 @@
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-gpm-primary" id="btn-toggle-scan" onclick="toggleScanner()" style="padding: 5px 12px; font-weight: 600;">▶ Bật Quét Tự Động</button>
+            <button class="btn btn-gpm-primary" id="btn-toggle-scan" onclick="toggleScanner()" style="padding: 5px 12px; font-weight: 600;">▶ Bật Quét Tự Động (1 Sáng - 1 Tối)</button>
+            <button class="btn btn-gpm-secondary" onclick="openCustomPostModal()" style="padding: 5px 10px; font-size: 11.5px; background: #fdf4ff; color: #a21caf; border-color: #f0abfc;" title="Đăng một video YouTube cụ thể bạn chọn lên profile đích">🎯 Đăng Video Tùy Chọn</button>
             <button class="btn btn-gpm-secondary" onclick="triggerKpiReport()" style="padding: 5px 10px; font-size: 11.5px;" title="Gửi báo cáo chỉ tiêu và nút duyệt bù ngay về Telegram">📊 Báo Cáo KPI (22:01)</button>
             <button class="btn btn-gpm-secondary" onclick="triggerVideoAudit()" style="padding: 5px 10px; font-size: 11.5px;" title="Kiểm tra Views, Likes, Shadowban, Trùng lặp">🛡 Kiểm Định Video (22:03)</button>
             <button class="btn btn-gpm-secondary" onclick="executeCompensation('bu1')" style="padding: 5px 10px; font-size: 11.5px; background: #fef3c7; color: #92400e; border-color: #fde68a;">🚀 Bù 1 Video / Kênh</button>
@@ -689,8 +690,15 @@
         <div style="display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 10px;">
           <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap;">
             <div style="display: flex; align-items: center; gap: 6px;">
+              <label style="margin: 0; font-size: 12px; white-space: nowrap;">Thứ tự lấy:</label>
+              <select id="scan-order-mode" class="form-control" style="padding: 4px 8px; width: auto; min-width: 220px;">
+                <option value="oldest_first" selected>⏳ Từ video cũ nhất ➔ Mới dần</option>
+                <option value="newest_first">⚡ Từ video mới nhất ➔ Cũ dần</option>
+              </select>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
               <label style="margin: 0; font-size: 12px; white-space: nowrap;">Tiêu đề / Caption:</label>
-              <select id="scan-title-mode" class="form-control" style="padding: 4px 8px; width: auto; min-width: 245px;">
+              <select id="scan-title-mode" class="form-control" style="padding: 4px 8px; width: auto; min-width: 230px;">
                 <option value="ai_rewrite" selected>🤖 AI viết lại (Title + Mô tả + Hashtag)</option>
                 <option value="keep_original">📝 Giữ tiêu đề gốc (tự dùng AI nếu thiếu)</option>
               </select>
@@ -713,22 +721,23 @@
       <!-- Danh Sách Ánh Xạ Kênh & Bảng Chỉ Tiêu -->
       <div class="gpm-card">
         <div class="card-header-bar">
-          <div class="card-title">📋 Bảng Quản Lý Kênh & Tiến Độ Chỉ Tiêu Hôm Nay</div>
+          <div class="card-title">📋 Bảng Quản Lý Kênh & Tiến Độ Chỉ Tiêu Hôm Nay (Lịch: 1 Sáng - 1 Tối)</div>
           <button class="btn btn-gpm-secondary" onclick="loadTrackedChannels()" style="padding: 3px 8px; font-size: 11px;">🔄 Làm mới</button>
         </div>
         <div class="gpm-table-wrapper">
           <table class="gpm-table">
             <thead>
               <tr>
-                <th style="width: 40px; text-align: center;">STT</th>
-                <th style="width: 100px;">Mã Acc</th>
+                <th style="width: 36px; text-align: center;">STT</th>
+                <th style="width: 90px;">Mã Acc</th>
                 <th>Kênh Nguồn (YouTube Shorts)</th>
                 <th>TikTok User Đích</th>
                 <th>Môi Trường Nuôi</th>
-                <th style="width: 135px; text-align: center;">Tiêu Đề / Caption</th>
+                <th style="width: 115px; text-align: center;">Thứ Tự Lấy</th>
+                <th style="width: 125px; text-align: center;">Tiêu Đề / Caption</th>
                 <th style="width: 135px; text-align: center;">Tiến Độ Hôm Nay</th>
-                <th style="width: 110px; text-align: center;">Trạng Thái</th>
-                <th style="width: 160px; text-align: center;">Thao Tác</th>
+                <th style="width: 100px; text-align: center;">Trạng Thái</th>
+                <th style="width: 180px; text-align: center;">Thao Tác</th>
               </tr>
             </thead>
             <tbody id="channels-table-body">
@@ -774,6 +783,28 @@
         <div class="form-group">
           <label>Chu Kỳ Quét Kênh (Giây):</label>
           <input type="number" id="cfg-scan-interval" class="form-control" value="600">
+        </div>
+
+        <div class="card-header-bar" style="margin-top: 18px;">
+          <div class="card-title">⏰ Lịch Trình Đăng Bài Hàng Ngày (1 Sáng - 1 Tối)</div>
+        </div>
+
+        <div class="form-row-3">
+          <div class="form-group">
+            <label>Giờ Đăng Buổi Sáng (*):</label>
+            <input type="text" id="cfg-morning-time" class="form-control" value="09:00" placeholder="09:00">
+            <small style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 3px;">Khung giờ đăng video 1 (Mặc định: 09:00).</small>
+          </div>
+          <div class="form-group">
+            <label>Giờ Đăng Buổi Tối (*):</label>
+            <input type="text" id="cfg-evening-time" class="form-control" value="19:00" placeholder="19:00">
+            <small style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 3px;">Khung giờ đăng video 2 (Mặc định: 19:00).</small>
+          </div>
+          <div class="form-group">
+            <label>Giãn Cách Tối Thiểu (Giờ):</label>
+            <input type="number" id="cfg-min-interval" class="form-control" value="4" min="1" max="12">
+            <small style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 3px;">Khoảng cách tối thiểu giữa video sáng và tối.</small>
+          </div>
         </div>
 
         <div style="display: flex; gap: 8px; margin-top: 14px;">
@@ -1034,6 +1065,36 @@
       <div class="modal-footer">
         <button class="btn btn-gpm-secondary" onclick="closeProxyExpiryModal()">Đóng</button>
         <button class="btn btn-gpm-primary" onclick="saveProxyExpiryModal()">Lưu Hạn Dùng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CUSTOM POST MODAL -->
+  <div class="modal-overlay" id="custom-post-modal" style="display: none;">
+    <div class="modal-gpm" style="max-width: 520px;">
+      <div class="modal-header">
+        <h2>🎯 Đăng Video YouTube Chỉ Định Sang TikTok</h2>
+        <button class="modal-close" onclick="closeCustomPostModal()">
+          <svg class="icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="modal-body" style="padding: 16px;">
+        <div class="form-group">
+          <label>Chọn Kênh / Profile Nhận (*):</label>
+          <select id="custom-post-channel-id" class="form-control" style="font-size: 13px; font-weight: 600;"></select>
+        </div>
+
+        <div class="form-group">
+          <label>Link Video YouTube (Shorts / Video thông thường) (*):</label>
+          <input type="text" id="custom-post-yt-url" class="form-control" placeholder="https://www.youtube.com/shorts/... hoặc https://youtu.be/..." style="font-size: 13px;">
+          <small style="font-size: 11px; color: var(--text-muted); display: block; margin-top: 4px;">
+            Quy trình: Tải video ➔ Render GPU NVENC lách bản quyền ➔ Mở Camoufox Antidetect ➔ Chờ Content Check Lite XANH ➔ Đăng lên TikTok Studio ➔ Báo cáo Telegram kèm Link xem video.
+          </small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-gpm-secondary" onclick="closeCustomPostModal()">Đóng</button>
+        <button class="btn btn-gpm-primary" onclick="submitCustomPost()">🚀 Bắt Đầu Đăng Ngay</button>
       </div>
     </div>
   </div>
@@ -1831,9 +1892,10 @@
       const tbody = document.getElementById('channels-table-body');
       if (!tbody) return;
       const allList = [...(summary.completed || []), ...(summary.incomplete || [])];
+      window._cachedChannels = allList;
       
       if (allList.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 24px;">Chưa có kênh nào được cấu hình ánh xạ. Hãy thêm kênh mới ở khung trên!</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-muted); padding: 24px;">Chưa có kênh nào được cấu hình ánh xạ. Hãy thêm kênh mới ở khung trên!</td></tr>`;
         return;
       }
 
@@ -1843,10 +1905,15 @@
           ? `<span class="pill" style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; font-weight: 600;">✅ ${ch.posted}/${ch.daily_target} Đã Đạt</span>`
           : `<span class="pill" style="background: #fef3c7; color: #b45309; border: 1px solid #fde68a; font-weight: 600;">⚠️ ${ch.posted}/${ch.daily_target} (Thiếu ${ch.missing})</span>`;
 
+        const isOldest = (ch.order_mode || 'oldest_first') === 'oldest_first';
+        const orderModeBtn = isOldest
+          ? `<button class="btn btn-gpm-secondary" onclick="toggleChannelOrderMode(${ch.id}, 'newest_first')" style="padding: 2px 7px; font-size: 11px; background: #fefce8; color: #a16207; border-color: #fef08a;" title="Bấm để đổi sang: Từ mới nhất">⏳ Cũ nhất</button>`
+          : `<button class="btn btn-gpm-secondary" onclick="toggleChannelOrderMode(${ch.id}, 'oldest_first')" style="padding: 2px 7px; font-size: 11px; background: #f0fdf4; color: #15803d; border-color: #bbf7d0;" title="Bấm để đổi sang: Từ cũ nhất">⚡ Mới nhất</button>`;
+
         const isKeepOriginal = ch.title_mode === 'keep_original';
         const titleModeBtn = isKeepOriginal
-          ? `<button class="btn btn-gpm-secondary" onclick="toggleChannelTitleMode(${ch.id}, 'ai_rewrite')" style="padding: 2px 7px; font-size: 11px; background: #f1f5f9; color: #334155; border-color: #cbd5e1;" title="Bấm để chuyển sang AI viết lại">📝 Giữ tiêu đề gốc</button>`
-          : `<button class="btn btn-gpm-secondary" onclick="toggleChannelTitleMode(${ch.id}, 'keep_original')" style="padding: 2px 7px; font-size: 11px; background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;" title="Bấm để chuyển sang Giữ tiêu đề gốc">🤖 AI viết lại</button>`;
+          ? `<button class="btn btn-gpm-secondary" onclick="toggleChannelTitleMode(${ch.id}, 'ai_rewrite')" style="padding: 2px 7px; font-size: 11px; background: #f1f5f9; color: #334155; border-color: #cbd5e1;" title="Bấm để chuyển sang AI viết lại">📝 Giữ gốc</button>`
+          : `<button class="btn btn-gpm-secondary" onclick="toggleChannelTitleMode(${ch.id}, 'keep_original')" style="padding: 2px 7px; font-size: 11px; background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe;" title="Bấm để chuyển sang Giữ tiêu đề gốc">🤖 AI viết</button>`;
 
         const isPaused = ch.status === 'PAUSED';
         const statusBtn = isPaused
@@ -1867,12 +1934,14 @@
               <span class="pill pill-proxy">Vùng: ${escapeHtml(ch.vpn_region)}</span>
               <span style="font-size: 11px; color: var(--text-muted); margin-left: 4px;">Profile: <b>${escapeHtml(ch.profile_name)}</b></span>
             </td>
+            <td style="text-align: center;">${orderModeBtn}</td>
             <td style="text-align: center;">${titleModeBtn}</td>
             <td style="text-align: center;">${progressBadge}</td>
             <td style="text-align: center;">${statusBtn}</td>
             <td style="text-align: center;">
-              <div style="display: flex; gap: 4px; justify-content: center;">
+              <div style="display: flex; gap: 4px; justify-content: center; align-items: center;">
                 <button class="btn btn-gpm-primary" onclick="runChannelNow(${ch.id})" style="padding: 2px 6px; font-size: 11px;" title="Quét tải và đăng 1 video ngay lập tức">▶ Chạy</button>
+                <button class="btn btn-gpm-secondary" onclick="openCustomPostModal(${ch.id})" style="padding: 2px 6px; font-size: 11px; background: #fdf4ff; color: #a21caf; border-color: #f0abfc;" title="Đăng video YouTube cụ thể bạn chọn cho kênh này">🎯 Link</button>
                 <button class="btn btn-gpm-secondary" onclick="runChannelNow(${ch.id})" style="padding: 2px 6px; font-size: 11px;" title="Đăng bù 1 video cho kênh">🚀 Bù</button>
                 <button class="btn-icon-sq delete" title="Xóa ánh xạ kênh" onclick="deleteTrackedChannel(${ch.id})">
                   <svg class="icon-sm" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
@@ -1903,6 +1972,7 @@
         daily_target: parseInt(document.getElementById('scan-daily-target').value) || 2,
         status: document.getElementById('scan-status').value,
         title_mode: document.getElementById('scan-title-mode').value,
+        order_mode: document.getElementById('scan-order-mode').value,
         post_to_tiktok: document.getElementById('scan-post-tt').checked,
         post_to_youtube: document.getElementById('scan-post-yt').checked
       };
@@ -1914,6 +1984,61 @@
           document.getElementById('scan-yt-url').value = '';
           document.getElementById('scan-acc-id').value = '';
           loadTrackedChannels();
+        } else {
+          alert('Lỗi: ' + res.msg);
+        }
+      }
+    }
+
+    async function toggleChannelOrderMode(channelId, newMode) {
+      if (window.pywebview && window.pywebview.api) {
+        const res = await window.pywebview.api.toggle_channel_order_mode(channelId, newMode);
+        if (res.ok) {
+          showToast(newMode === 'oldest_first' ? 'Đã đổi: Lấy từ video cũ nhất' : 'Đã đổi: Lấy từ video mới nhất');
+          loadTrackedChannels();
+        } else {
+          alert('Lỗi: ' + res.msg);
+        }
+      }
+    }
+
+    function openCustomPostModal(channelId) {
+      const modal = document.getElementById('custom-post-modal');
+      const sel = document.getElementById('custom-post-channel-id');
+      if (sel && window._cachedChannels && window._cachedChannels.length > 0) {
+        sel.innerHTML = window._cachedChannels.map(c => 
+          `<option value="${c.id}" ${channelId && c.id == channelId ? 'selected' : ''}>Kênh #${c.id} - ${escapeHtml(c.profile_name)} (${escapeHtml(c.tiktok_user || c.source_handle)})</option>`
+        ).join('');
+      } else if (sel && allProfiles && allProfiles.length > 0) {
+        sel.innerHTML = allProfiles.map(p => 
+          `<option value="${p.id}">Profile: ${escapeHtml(p.name)}</option>`
+        ).join('');
+      }
+      document.getElementById('custom-post-yt-url').value = '';
+      modal.style.display = 'flex';
+    }
+
+    function closeCustomPostModal() {
+      document.getElementById('custom-post-modal').style.display = 'none';
+    }
+
+    async function submitCustomPost() {
+      const chId = document.getElementById('custom-post-channel-id').value;
+      const url = document.getElementById('custom-post-yt-url').value.trim();
+      if (!url) {
+        alert('Vui lòng nhập Link video YouTube cần đăng!');
+        return;
+      }
+      if (!chId) {
+        alert('Vui lòng chọn kênh/profile nhận video!');
+        return;
+      }
+      closeCustomPostModal();
+      showToast('🚀 Đang bắt đầu tải và đăng video tùy chọn...');
+      if (window.pywebview && window.pywebview.api) {
+        const res = await window.pywebview.api.run_channel_custom_video(parseInt(chId), url);
+        if (res.ok) {
+          showToast(res.msg || 'Đã kích hoạt đăng video chỉ định!');
         } else {
           alert('Lỗi: ' + res.msg);
         }
@@ -2058,7 +2183,10 @@
         document.getElementById('cfg-tele-token').value = cfg.telegram_bot_token || '';
         document.getElementById('cfg-tele-chat').value = cfg.telegram_chat_id || '';
         document.getElementById('cfg-gemini-key').value = cfg.gemini_api_key || '';
-        document.getElementById('cfg-scan-interval').value = cfg.scan_interval_seconds || 600;
+        document.getElementById('cfg-scan-interval').value = cfg.scan_interval_seconds || 60;
+        document.getElementById('cfg-morning-time').value = cfg.schedule_morning_time || '09:00';
+        document.getElementById('cfg-evening-time').value = cfg.schedule_evening_time || '19:00';
+        document.getElementById('cfg-min-interval').value = cfg.min_post_interval_hours || 4;
       }
     }
 
@@ -2067,7 +2195,10 @@
         telegram_bot_token: document.getElementById('cfg-tele-token').value.trim(),
         telegram_chat_id: document.getElementById('cfg-tele-chat').value.trim(),
         gemini_api_key: document.getElementById('cfg-gemini-key').value.trim(),
-        scan_interval_seconds: parseInt(document.getElementById('cfg-scan-interval').value.trim()) || 600
+        scan_interval_seconds: parseInt(document.getElementById('cfg-scan-interval').value.trim()) || 60,
+        schedule_morning_time: document.getElementById('cfg-morning-time').value.trim() || '09:00',
+        schedule_evening_time: document.getElementById('cfg-evening-time').value.trim() || '19:00',
+        min_post_interval_hours: parseFloat(document.getElementById('cfg-min-interval').value.trim()) || 4
       };
       if (window.pywebview && window.pywebview.api) {
         const res = await window.pywebview.api.save_system_settings(cfg);

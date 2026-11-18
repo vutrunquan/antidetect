@@ -59,9 +59,9 @@ def detect_best_video_encoder():
         candidates.append(("h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-b:v", "18M"]))
     
     candidates.extend([
-        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20"]),
-        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast"]),
-        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed"])
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "6M", "-maxrate", "8M", "-bufsize", "12M"]),
+        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-b:v", "6M"]),
+        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-b:v", "6M"])
     ])
 
     for enc, args in candidates:
@@ -115,8 +115,11 @@ def render_anti_copyright_video(
 
     log(f"🎬 Bắt đầu tối ưu lách bản quyền & mã băm cho video: {os.path.basename(input_path)}")
 
-    # 1. Video Filter: Zoom 1.03x, crop trung tâm, unsharp làm nét, tăng contrast & saturation
+    # 1. Video Filter:
+    # - Chuẩn hóa độ phân giải Full HD (1080p) chuẩn TikTok (tránh file 4K nặng > 200MB gây nghẽn upload qua proxy)
+    # - Zoom 1.03x, crop trung tâm, unsharp làm nét, tăng contrast & saturation
     vf_filter = (
+        f"scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':-2:flags=lanczos,"
         f"scale=iw*{zoom_ratio}:ih*{zoom_ratio}:flags=lanczos,"
         f"crop=iw/{zoom_ratio}:ih/{zoom_ratio},"
         f"unsharp=3:3:0.8:3:3:0.0,"
