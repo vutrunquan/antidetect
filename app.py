@@ -513,7 +513,7 @@ class Api:
                 daily_target=int(data.get("daily_target", 2)),
                 status=data.get("status", "ACTIVE"),
                 title_mode=data.get("title_mode", "ai_rewrite"),
-                order_mode=data.get("order_mode", "oldest_first"),
+                order_mode=data.get("order_mode", "newest_first"),
                 crop_mode=data.get("crop_mode", "blur_9_16"),
                 series_name=data.get("series_name", "").strip()
             )
@@ -761,30 +761,66 @@ class Api:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-def main():
-    api = Api()
-    # Tự động khởi động Telegram bot polling nếu có cấu hình
+def cleanup_previous_instances():
+    """Tự động dọn dẹp các tiến trình app.py cũ chạy ngầm để tránh xung đột cổng và lỗi Telegram 409 Conflict."""
     try:
-        from telegram_controller import start_telegram_polling_thread
-        start_telegram_polling_thread()
+        import psutil
+        current_pid = os.getpid()
+        parent_pid = os.getppid()
+        current_proc = psutil.Process(current_pid)
+        current_create_time = current_proc.create_time()
+
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                pid = proc.info['pid']
+                if pid in (current_pid, parent_pid):
+                    continue
+                # Không bao giờ kill process mới tạo cùng thời điểm hoặc con/cha
+                if proc.info.get('create_time', 0) >= current_create_time - 1.0:
+                    continue
+                if proc.info['name'] and 'python' in proc.info['name'].lower():
+                    cmdline = proc.info.get('cmdline') or []
+                    is_app_py = any(arg.lower().endswith("app.py") or arg.lower() == "app.py" for arg in cmdline)
+                    if is_app_py and "--run-profile" not in " ".join(cmdline):
+                        proc.kill()
+            except Exception:
+                pass
     except Exception:
         pass
-    resource_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    ui_path = os.path.join(resource_dir, "ui", "index.html")
-    if not os.path.exists(ui_path):
-        ui_path = os.path.join(BASE_DIR, "ui", "index.html")
 
-    window = webview.create_window(
-        title="Camoufox Antidetect & Auto Studio",
-        url=ui_path,
-        js_api=api,
-        width=1200,
-        height=800,
-        min_size=(1020, 680),
-        background_color="#090D16"
-    )
-    api.set_window(window)
-    webview.start(debug=False)
+def main():
+    try:
+        cleanup_previous_instances()
+        api = Api()
+        # Tự động khởi động Telegram bot polling nếu có cấu hình
+        try:
+            from telegram_controller import start_telegram_polling_thread
+            start_telegram_polling_thread()
+        except Exception:
+            pass
+        resource_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        ui_path = os.path.join(resource_dir, "ui", "index.html")
+        if not os.path.exists(ui_path):
+            ui_path = os.path.join(BASE_DIR, "ui", "index.html")
+
+        window = webview.create_window(
+            title="Camoufox Antidetect & Auto Studio",
+            url=ui_path,
+            js_api=api,
+            width=1200,
+            height=800,
+            min_size=(1020, 680),
+            background_color="#090D16"
+        )
+        api.set_window(window)
+        webview.start(debug=False)
+        # Thoát sạch toàn bộ tiến trình con & thread ngầm khi đóng cửa sổ giao diện
+        os._exit(0)
+    except Exception as e:
+        import traceback
+        print(f"\n[CRITICAL ERROR]: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     if "--run-profile" in sys.argv:

@@ -125,7 +125,7 @@ def init_db():
         daily_target INTEGER DEFAULT 2,
         status TEXT DEFAULT 'ACTIVE',
         title_mode TEXT DEFAULT 'ai_rewrite',
-        order_mode TEXT DEFAULT 'oldest_first',
+        order_mode TEXT DEFAULT 'newest_first',
         post_to_tiktok INTEGER DEFAULT 1,
         post_to_youtube INTEGER DEFAULT 1,
         created_at TEXT DEFAULT ''
@@ -138,7 +138,7 @@ def init_db():
         ("daily_target", "INTEGER DEFAULT 2"),
         ("status", "TEXT DEFAULT 'ACTIVE'"),
         ("title_mode", "TEXT DEFAULT 'ai_rewrite'"),
-        ("order_mode", "TEXT DEFAULT 'oldest_first'"),
+        ("order_mode", "TEXT DEFAULT 'newest_first'"),
         ("crop_mode", "TEXT DEFAULT 'blur_9_16'"),
         ("series_name", "TEXT DEFAULT ''"),
         ("jitter_enabled", "INTEGER DEFAULT 1"),
@@ -184,6 +184,11 @@ def init_db():
             conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {col_type}")
         except Exception:
             pass
+
+    try:
+        conn.execute("UPDATE channels SET order_mode = 'newest_first' WHERE order_mode = 'oldest_first' OR order_mode IS NULL OR order_mode = ''")
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -281,7 +286,7 @@ def add_tracked_channel(
     daily_target: int = 2,
     status: str = "ACTIVE",
     title_mode: str = "ai_rewrite",
-    order_mode: str = "oldest_first",
+    order_mode: str = "newest_first",
     crop_mode: str = "blur_9_16",
     series_name: str = ""
 ):
@@ -291,7 +296,7 @@ def add_tracked_channel(
     if not account_id:
         account_id = generate_account_id()
     norm_title_mode = "keep_original" if str(title_mode).strip().lower() == "keep_original" else "ai_rewrite"
-    norm_order_mode = "newest_first" if str(order_mode).strip().lower() == "newest_first" else "oldest_first"
+    norm_order_mode = "oldest_first" if str(order_mode).strip().lower() == "oldest_first" else "newest_first"
     norm_crop_mode = str(crop_mode).strip() if crop_mode else "blur_9_16"
 
     if not profile_dir:
@@ -407,7 +412,7 @@ def get_all_channels_kpi_summary(target_date: str = None) -> dict:
             "vpn_region": ch.get("vpn_region", "VN"),
             "status": ch_status,
             "title_mode": (ch.get("title_mode") or "ai_rewrite").lower(),
-            "order_mode": (ch.get("order_mode") or "oldest_first").lower(),
+            "order_mode": (ch.get("order_mode") or "newest_first").lower(),
             "daily_target": daily_target,
             "posted": posted,
             "missing": max(0, daily_target - posted)
@@ -672,7 +677,7 @@ def download_and_verify_youtube_video(video_url: str, log_callback=None) -> dict
             "is_1080": min(real_w, real_h) >= 1070
         }
 
-def fetch_channel_short(channel_shorts_url: str, order_mode: str = "oldest_first", max_lookback: int = 300, log_callback=None) -> dict | None:
+def fetch_channel_short(channel_shorts_url: str, order_mode: str = "newest_first", max_lookback: int = 300, log_callback=None) -> dict | None:
     """
     Quét danh sách video từ kênh YouTube và chọn video phù hợp:
     - Nếu order_mode == 'oldest_first': Quét từ video CŨ NHẤT tịnh tiến dần lên mới nhất chưa từng xử lý.
@@ -1209,6 +1214,99 @@ def wait_for_content_check(page, max_wait_seconds: int = 90, log_callback=None) 
 
     return True, "Content Check Lite: HỢP LỆ (Hết thời gian quét - Không có vi phạm)"
 
+def fill_tiktok_caption(page, caption: str, logger=None):
+    """
+    Điền Caption vào trình soạn thảo Draft.js / Contenteditable của TikTok Studio:
+    - Xóa sạch text mặc định (TikTok tự động điền tên file video như 16HBNLDICu4_remix vào ô caption).
+    - Hỗ trợ nhập chuỗi đầy đủ bằng keyboard native và fallback clipboard paste.
+    """
+    def _l(msg):
+        if logger:
+            try: logger(msg)
+            except Exception: pass
+
+    if not caption or not caption.strip():
+        _l("⚠️ Caption rỗng, bỏ qua bước nhập caption.")
+        return
+
+    _l("✍️ Đang nhập Caption và Hashtags vào TikTok Studio...")
+    dismiss_tiktok_popups(page, logger)
+    caption_box = page.locator('div[contenteditable="true"], div.public-DraftEditor-content, div[role="combobox"]').first
+    caption_box.wait_for(state="visible", timeout=30000)
+
+    # Focus vào ô caption
+    for _ in range(3):
+        try:
+            caption_box.click(timeout=3000)
+            break
+        except Exception:
+            dismiss_tiktok_popups(page, logger)
+            time.sleep(0.5)
+
+    # 1. Xóa sạch mọi text đang có trong ô (TikTok tự chèn tên file video)
+    time.sleep(0.5)
+    page.keyboard.press(SELECT_ALL_SHORTCUT)
+    time.sleep(0.2)
+    page.keyboard.press("Backspace")
+    time.sleep(0.2)
+    page.keyboard.press("Delete")
+    time.sleep(0.3)
+
+    # Bổ trợ: xóa sạch bằng Range Selection nếu Backspace bị chặn bởi Draft.js
+    page.evaluate("""() => {
+        const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+        if (el) {
+            el.focus();
+            const sel = window.getSelection();
+            if (sel) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+        }
+    }""")
+    time.sleep(0.2)
+    page.keyboard.press("Backspace")
+    time.sleep(0.3)
+
+    # 2. Nhập Caption mới
+    try:
+        page.keyboard.insert_text(caption)
+        time.sleep(0.5)
+    except Exception as e_ins:
+        _l(f"⚠️ insert_text gặp sự cố: {e_ins}")
+
+    # Kiểm tra xem text thực tế trong ô đã đúng chưa
+    current_text = page.evaluate("""() => {
+        const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+        return el ? (el.innerText || el.textContent || '').trim() : '';
+    }""")
+
+    # Nếu ô vẫn còn dính tên file cũ (_remix) hoặc độ dài không đạt yêu cầu -> Fallback dán clipboard
+    if not current_text or "_remix" in current_text or len(current_text) < 10:
+        _l("⚠️ Kích hoạt phương thức Clipboard Paste bổ trợ cho TikTok Caption...")
+        try:
+            caption_box.click(force=True)
+            page.keyboard.press(SELECT_ALL_SHORTCUT)
+            page.keyboard.press("Backspace")
+            time.sleep(0.2)
+            page.evaluate("""(txt) => {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(txt);
+                }
+            }""", caption)
+            page.keyboard.press("Control+v")
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    final_len = page.evaluate("""() => {
+        const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
+        return el ? (el.innerText || el.textContent || '').trim().length : 0;
+    }""")
+    _l(f"✅ Đã hoàn tất nhập Caption ({final_len} ký tự).")
+
 # ================= 4. TIKTOK STUDIO AUTOMATION (CAMOUFOX) =================
 def upload_to_tiktok_with_fallback(
     video_4k_path: str,
@@ -1275,40 +1373,7 @@ def upload_to_tiktok_with_fallback(
                 time.sleep(3)
 
                 # 2. Nhập Caption & Hashtag
-                _log("✍️ Đang nhập Caption và Hashtags SEO...")
-                dismiss_tiktok_popups(page, _log)
-                caption_box = page.locator('div[contenteditable="true"], div.public-DraftEditor-content, div[role="combobox"]').first
-                caption_box.wait_for(state="visible", timeout=30000)
-                try:
-                    caption_box.click(timeout=3000)
-                except Exception:
-                    dismiss_tiktok_popups(page, _log)
-                    caption_box.click(force=True)
-
-                # Xóa sạch text mặc định và chèn caption bằng native event
-                try:
-                    page.evaluate("""(text) => {
-                        const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
-                        if (el) {
-                            el.focus();
-                            document.execCommand('selectAll', false, null);
-                            document.execCommand('delete', false, null);
-                            document.execCommand('insertText', false, text);
-                        }
-                    }""", caption)
-                except Exception:
-                    pass
-
-                typed_len = page.evaluate("""() => {
-                    const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
-                    return el ? (el.innerText || '').trim().length : 0;
-                }""")
-                if typed_len == 0:
-                    page.keyboard.press(SELECT_ALL_SHORTCUT)
-                    page.keyboard.press("Backspace")
-                    time.sleep(0.3)
-                    page.keyboard.insert_text(caption)
-                time.sleep(1)
+                fill_tiktok_caption(page, caption, _log)
 
                 # 3. Chờ video upload hoàn tất lên máy chủ TikTok (Upload 100%)
                 _log("⏳ Đang tải video lên máy chủ TikTok và đợi nạp hoàn tất...")
@@ -1405,39 +1470,8 @@ def upload_to_tiktok_with_fallback(
                         file_input.set_input_files(remedied_path)
                         time.sleep(3)
 
-                        _log("✍️ Nhập lại Caption sau khi tải lại trang...")
-                        dismiss_tiktok_popups(page, _log)
-                        caption_box = page.locator('div[contenteditable="true"], div.public-DraftEditor-content, div[role="combobox"]').first
-                        caption_box.wait_for(state="visible", timeout=30000)
-                        try:
-                            caption_box.click(timeout=3000)
-                        except Exception:
-                            dismiss_tiktok_popups(page, _log)
-                            caption_box.click(force=True)
-
-                        try:
-                            page.evaluate("""(text) => {
-                                const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
-                                if (el) {
-                                    el.focus();
-                                    document.execCommand('selectAll', false, null);
-                                    document.execCommand('delete', false, null);
-                                    document.execCommand('insertText', false, text);
-                                }
-                            }""", caption)
-                        except Exception:
-                            pass
-
-                        typed_len = page.evaluate("""() => {
-                            const el = document.querySelector('div[contenteditable="true"], div.public-DraftEditor-content');
-                            return el ? (el.innerText || '').trim().length : 0;
-                        }""")
-                        if typed_len == 0:
-                            page.keyboard.press(SELECT_ALL_SHORTCUT)
-                            page.keyboard.press("Backspace")
-                            time.sleep(0.3)
-                            page.keyboard.insert_text(caption)
-                        time.sleep(1)
+                        # Nhập lại Caption sau khi tải lại trang
+                        fill_tiktok_caption(page, caption, _log)
 
                     toggle_auto_copyright_and_content_checks(page, _log)
                     _log("🔄 Đã nạp video đã sửa âm thanh, đang đợi Content Check Lite quét lại...")
@@ -1903,7 +1937,8 @@ def process_and_upload_local_video(
     # 1. Xử lý Video (FFmpeg Upscale 4K hoặc đo thông số gốc)
     if apply_4k_upscale:
         _log("🎬 Kích hoạt bộ lọc FFmpeg: Upscale 4K (2160x3840), đổi mã băm khung hình và tối ưu màu sắc...")
-        rendered_4k_path = os.path.join(dl_dir, f"{video_id}_4k.mp4")
+        clean_vname = "".join(c if (c.isalnum() or c in " -_()[]") else "" for c in clean_title).strip()[:50] or video_id
+        rendered_4k_path = os.path.join(dl_dir, f"{clean_vname}_{video_id[:6]}_4k.mp4")
         stats = edit_and_upscale_4k(video_path, rendered_4k_path)
         ready_video_path = rendered_4k_path
         quality_str = stats.get("resolution_str", "4K Ultra HD")
@@ -2110,7 +2145,7 @@ def run_single_channel_download_and_post(channel_id: int, specific_video_url: st
             _log(f"❌ Không thể tải hoặc xử lý video chỉ định: {specific_video_url}")
             return {"success": False, "error": f"Không thể tải video chỉ định: {specific_video_url}"}
     else:
-        order_mode = (ch.get("order_mode") or "oldest_first").lower()
+        order_mode = (ch.get("order_mode") or "newest_first").lower()
         mode_label = "Từ cũ nhất" if order_mode == "oldest_first" else "Từ mới nhất"
         _log(f"🔎 Đang quét video từ: {yt_url} (Chế độ: {mode_label})...")
         item = fetch_channel_short(yt_url, order_mode=order_mode, log_callback=_log)
@@ -2122,7 +2157,10 @@ def run_single_channel_download_and_post(channel_id: int, specific_video_url: st
     _log(f"✨ Phát hiện video Shorts: '{item['title']}' ({item.get('quality_str', 'HD')}). Chế độ cắt: {crop_mode}. Tiến hành render lách bản quyền...")
     dl_dir = os.path.join(BASE_DIR, "downloads")
     os.makedirs(dl_dir, exist_ok=True)
-    out_remix = os.path.join(dl_dir, f"{item['video_id']}_remix.mp4")
+    raw_vtitle = item.get("title", "") or item.get("video_id", "shorts")
+    clean_vtitle = "".join(c if (c.isalnum() or c in " -_()[]") else "" for c in raw_vtitle).strip()
+    clean_vtitle = clean_vtitle[:50].strip() or item["video_id"]
+    out_remix = os.path.join(dl_dir, f"{clean_vtitle}_{item['video_id'][:6]}.mp4")
     stats = edit_and_upscale_4k(
         item["raw_path"], 
         out_remix, 

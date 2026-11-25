@@ -4,12 +4,12 @@ import os
 # Đảm bảo UTF-8 cho stdout/stderr trên Windows
 if sys.stdout is not None:
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except Exception:
         pass
 if sys.stderr is not None:
     try:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except Exception:
         pass
 
@@ -20,24 +20,7 @@ from urllib.parse import urlparse
 from camoufox.sync_api import Camoufox
 from camoufox.fingerprints import Screen
 from camoufox.addons import DefaultAddons
-
-def parse_proxy(proxy_str: str):
-    if not proxy_str or not proxy_str.strip():
-        return None
-    s = proxy_str.strip()
-    parts = s.split(":")
-    if len(parts) == 4 and not ("://" in s):
-        ip, port, user, pwd = parts
-        return {"server": f"http://{ip}:{port}", "username": user, "password": pwd}
-    if not ("://" in s):
-        s = "http://" + s
-    parsed = urlparse(s)
-    res = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        res["username"] = parsed.username
-    if parsed.password:
-        res["password"] = parsed.password
-    return res
+from proxy_bridge import parse_proxy, setup_camoufox_proxy
 
 def main():
     parser = argparse.ArgumentParser(description="Camoufox Standalone Profile Runner")
@@ -72,12 +55,14 @@ def main():
             except Exception:
                 pass
 
-    proxy_cfg = parse_proxy(args.proxy) if args.proxy else None
+    proxy_cfg, bridge = setup_camoufox_proxy(args.proxy) if args.proxy else (None, None)
     has_proxy = proxy_cfg is not None
 
     print(f"[*] Khởi chạy Camoufox Profile: {profile_dir}")
     print(f"[*] OS Giả lập: {args.os}")
-    print(f"[*] Proxy: {proxy_cfg['server'] if proxy_cfg else 'None (Mạng trực tiếp)'}")
+    print(f"[*] Proxy: {args.proxy if args.proxy else 'None (Mạng trực tiếp)'}")
+    if bridge:
+        print(f"[*] Kích hoạt Cầu nối SOCKS5 -> HTTP Cục bộ: {proxy_cfg['server']}")
     print(f"[*] Màn hình: {args.screen}")
     print(f"[*] URL ban đầu: {args.url}")
 
@@ -132,8 +117,8 @@ def main():
     should_auto_login = args.auto_login or (autologin_cfg and autologin_cfg.get("enabled"))
     app_type = (autologin_cfg.get("type") if autologin_cfg else None) or args.auto_login_type or "tiktok"
 
-    try:
-        with Camoufox(**camoufox_kwargs) as context:
+    def run_browser_session(kwargs):
+        with Camoufox(**kwargs) as context:
             page = context.pages[0] if context.pages else context.new_page()
 
             target_url = args.url.strip() if args.url.strip() else "https://www.tiktok.com"
@@ -175,9 +160,23 @@ def main():
                 except Exception:
                     break
 
+    try:
+        try:
+            run_browser_session(camoufox_kwargs)
+        except Exception as e:
+            err_str = str(e)
+            if ("Failed to get IP address" in err_str or "BadStatusLine" in err_str or "geoip" in err_str.lower()) and camoufox_kwargs.get("geoip"):
+                print(f"[!] Lỗi định vị GeoIP qua proxy ({e}). Đang khởi động lại trình duyệt ở chế độ an toàn...", file=sys.stderr)
+                camoufox_kwargs["geoip"] = False
+                run_browser_session(camoufox_kwargs)
+            else:
+                raise
     except Exception as e:
         print(f"[!] Lỗi khi chạy Camoufox: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        if bridge:
+            bridge.stop()
 
     print("[*] Profile đã đóng hoàn tất.")
 

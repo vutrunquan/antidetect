@@ -512,6 +512,9 @@ def _register_handlers(bot: telebot.TeleBot):
         except Exception as e:
             bot.reply_to(message, f"❌ Lỗi: {e}")
 
+import logging
+telebot.logger.setLevel(logging.CRITICAL)
+
 _tele_polling_thread = None
 
 def start_telegram_polling_thread():
@@ -523,10 +526,18 @@ def start_telegram_polling_thread():
         return _tele_polling_thread
 
     def _poll():
-        try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=15)
-        except Exception as e:
-            print(f"[Telegram Polling Stopped]: {e}")
+        while True:
+            try:
+                bot.infinity_polling(timeout=20, long_polling_timeout=15, skip_pending=True)
+                break
+            except Exception as e:
+                err_str = str(e)
+                if "409" in err_str or "Conflict" in err_str:
+                    print(f"⚠️ [Telegram Bot]: Phát hiện tiến trình khác đang dùng chung Bot Token (409 Conflict). Đang chờ 10s để thử lại...")
+                    time.sleep(10)
+                else:
+                    print(f"[Telegram Polling Error]: {e}")
+                    time.sleep(5)
 
     _tele_polling_thread = threading.Thread(target=_poll, daemon=True)
     _tele_polling_thread.start()
