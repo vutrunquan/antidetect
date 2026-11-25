@@ -881,7 +881,7 @@
         <div class="m-tab active" onclick="switchModalTab(0, this)">Cấu Hình Chung</div>
         <div class="m-tab" onclick="switchModalTab(1, this)">Proxy & Mạng</div>
         <div class="m-tab" onclick="switchModalTab(2, this)">Vân Tay Camoufox</div>
-        <div class="m-tab" onclick="switchModalTab(3, this)">Auto-Login DongVanFB</div>
+        <div class="m-tab" onclick="switchModalTab(3, this)">Auto-Login (Smail1s / 2FA)</div>
       </div>
 
       <div class="modal-body">
@@ -1000,7 +1000,7 @@
           </div>
         </div>
 
-        <!-- TAB 3: AUTO LOGIN DONGVANFB -->
+        <!-- TAB 3: AUTO LOGIN SMAIL1S -->
         <div class="tab-content" id="tab-3">
           <div class="form-group">
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -1010,25 +1010,31 @@
           </div>
 
           <div class="form-group">
-            <label style="display: flex; justify-content: space-between;">
-              <span>Chuỗi tài khoản 7 trường (DongVanFB):</span>
-              <span style="color: #0284c7; cursor: pointer;" onclick="formatSampleAccount()">⚡ Dán mẫu thử</span>
+            <label style="display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap;">
+              <span>Chuỗi tài khoản (7 trường Mail / 9 trường có 2FA):</span>
+              <span style="display: flex; gap: 10px;">
+                <span style="color: #7c3aed; cursor: pointer;" onclick="formatSampleAccount2FA()">🔐 Mẫu 9 trường (2FA)</span>
+                <span style="color: #0284c7; cursor: pointer;" onclick="formatSampleAccount()">⚡ Mẫu 7 trường</span>
+              </span>
             </label>
-            <textarea id="f-account-str" class="form-control" rows="3" style="font-family: var(--font-mono); font-size: 11px;" placeholder="username|password|email|passmail|refreshToken|clientId|mailBackup" oninput="updateParsedAccount()"></textarea>
+            <textarea id="f-account-str" class="form-control" rows="3" style="font-family: var(--font-mono); font-size: 11px;" placeholder="user|pass|2fa|mail|passmail|token|id|mailkhoiphuc|quocgia  HOẶC  user|pass|mail|passmail|token|id|mailBackup" oninput="updateParsedAccount()"></textarea>
           </div>
 
           <div id="parsed-account-box" style="background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 11px;">
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
               <div>User: <b id="parse-user" style="color: #0284c7;">-</b></div>
               <div>Pass: <b id="parse-pass" style="color: var(--text-main);">-</b></div>
+              <div>Mã 2FA: <b id="parse-2fa" style="color: #7c3aed; word-break: break-all;">-</b></div>
+              <div>Quốc gia: <b id="parse-country" style="color: #0f766e;">-</b></div>
               <div>Email OTP: <b id="parse-email" style="color: #16a34a;">-</b></div>
               <div>Passmail: <b id="parse-passmail" style="color: var(--text-main);">-</b></div>
               <div style="grid-column: span 2;">Client ID: <b id="parse-clientid" style="color: #d97706; word-break: break-all;">-</b></div>
             </div>
           </div>
 
-          <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
-            <button class="btn btn-gpm-success" type="button" onclick="testDongVanApi()">📬 Thử Lấy Mã OTP</button>
+          <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-gpm-secondary" type="button" onclick="test2faCode()" style="background: #f5f3ff; color: #6d28d9; border-color: #c4b5fd;">🔐 Thử Lấy Mã 2FA</button>
+            <button class="btn btn-gpm-success" type="button" onclick="testDongVanApi()">📬 Thử Lấy Mã OTP Mail</button>
             <span id="mail-check-status" style="font-size: 11px; color: var(--text-muted);">Chưa kiểm tra</span>
           </div>
         </div>
@@ -1696,21 +1702,80 @@
       const raw = document.getElementById('f-account-str').value.trim();
       let parts = [];
       if (raw) {
-        const line = raw.split('\n').find(l => l.includes('|')) || raw;
+        const line = raw.split('\n').find(l => l.includes('|') || l.includes('@')) || raw;
         parts = line.split('|').map(s => s.trim());
       }
-      document.getElementById('parse-user').innerText = parts[0] || '-';
-      document.getElementById('parse-pass').innerText = parts[1] ? ('•••••••• (' + parts[1].slice(0, 3) + '...)') : '-';
-      document.getElementById('parse-email').innerText = parts[2] || '-';
-      document.getElementById('parse-passmail').innerText = parts[3] ? '••••••••' : '-';
-      document.getElementById('parse-clientid').innerText = parts[5] || '-';
+      let user = '', pass = '', twoFa = '', email = '', passmail = '', clientId = '', country = '';
+      if (parts.length >= 4 && !parts[2].includes('@') && parts[3].includes('@')) {
+        // Định dạng 9 trường có 2FA: user|pass|2fa|mail|passmail|token|id|mailkhoiphuc|quocgia
+        user = parts[0] || '';
+        pass = parts[1] || '';
+        twoFa = parts[2] || '';
+        email = parts[3] || '';
+        passmail = parts[4] || '';
+        clientId = parts[6] || '';
+        country = parts[8] || '';
+      } else if (parts.length >= 1 && parts[0].includes('@') && (parts.length <= 4 || !(parts[2] || '').includes('@'))) {
+        // Định dạng mail Smail1s trực tiếp
+        email = parts[0] || '';
+        if (parts.length === 2) {
+          passmail = parts[1] || '';
+        } else if (parts.length === 3) {
+          clientId = parts[2] || '';
+        } else if (parts.length >= 4) {
+          passmail = parts[1] || '';
+          clientId = parts[3] || '';
+        }
+      } else {
+        // Định dạng 7 trường chuẩn: user|pass|mail|passmail|token|id|mailBackup
+        user = parts[0] || '';
+        pass = parts[1] || '';
+        email = parts[2] || '';
+        passmail = parts[3] || '';
+        clientId = parts[5] || '';
+        country = parts[7] || '';
+      }
+      document.getElementById('parse-user').innerText = user || '-';
+      document.getElementById('parse-pass').innerText = pass ? ('•••••••• (' + pass.slice(0, 3) + '...)') : '-';
+      const el2fa = document.getElementById('parse-2fa');
+      if (el2fa) el2fa.innerText = twoFa || '-';
+      const elCountry = document.getElementById('parse-country');
+      if (elCountry) elCountry.innerText = country || '-';
+      document.getElementById('parse-email').innerText = email || '-';
+      document.getElementById('parse-passmail').innerText = passmail ? '••••••••' : '-';
+      document.getElementById('parse-clientid').innerText = clientId || '-';
     }
 
     function formatSampleAccount() {
       document.getElementById('f-account-str').value = 'username|password|email@hotmail.com|passmail|M.C561_BAY.0.U...|client-id-uuid|backup@email.com';
       document.getElementById('f-auto-login').checked = true;
       updateParsedAccount();
-      showToast('Đã dán mẫu tài khoản');
+      showToast('Đã dán mẫu 7 trường (Mail OTP)');
+    }
+
+    function formatSampleAccount2FA() {
+      document.getElementById('f-account-str').value = 'username|password|JBSWY3DPEHPK3PXP|email@hotmail.com|passmail|M.C561_BAY.0.U...|client-id-uuid|backup@email.com|US';
+      document.getElementById('f-auto-login').checked = true;
+      updateParsedAccount();
+      showToast('Đã dán mẫu 9 trường (Có 2FA)');
+    }
+
+    async function test2faCode() {
+      const accStr = document.getElementById('f-account-str').value.trim();
+      const statusLbl = document.getElementById('mail-check-status');
+      if (!accStr) {
+        statusLbl.innerHTML = '<span style="color: var(--warning);">⚠️ Vui lòng nhập chuỗi tài khoản có 2FA</span>';
+        return;
+      }
+      statusLbl.innerHTML = '<span style="color: #7c3aed;">⏳ Đang tính mã 2FA (TOTP)...</span>';
+      if (window.pywebview && window.pywebview.api) {
+        const res = await window.pywebview.api.test_2fa_code(accStr);
+        if (res.ok) {
+          statusLbl.innerHTML = `<span style="color: #6d28d9; font-weight: 600;">🔐 Mã 2FA: ${escapeHtml(res.code)} (còn ${res.remaining}s)</span>`;
+        } else {
+          statusLbl.innerHTML = `<span style="color: var(--danger);">❌ ${escapeHtml(res.msg)}</span>`;
+        }
+      }
     }
 
     async function testDongVanApi() {
@@ -1720,11 +1785,12 @@
         statusLbl.innerHTML = '<span style="color: var(--warning);">⚠️ Vui lòng nhập chuỗi tài khoản</span>';
         return;
       }
-      statusLbl.innerHTML = '<span style="color: var(--primary);">⏳ Đang gọi DongVanFB API...</span>';
+      statusLbl.innerHTML = '<span style="color: var(--primary);">⏳ Đang gọi Smail1s API...</span>';
       if (window.pywebview && window.pywebview.api) {
         const res = await window.pywebview.api.test_dongvan_api(accStr, 'tiktok');
         if (res.ok) {
-          statusLbl.innerHTML = `<span style="color: var(--success); font-weight: 600;">✅ Mã OTP: ${escapeHtml(res.code)}</span>`;
+          const srcTag = res.mail_source ? ` (${escapeHtml(res.mail_source)})` : '';
+          statusLbl.innerHTML = `<span style="color: var(--success); font-weight: 600;">✅ Mã OTP${srcTag}: ${escapeHtml(res.code)}</span>`;
         } else {
           statusLbl.innerHTML = `<span style="color: var(--danger);">❌ ${escapeHtml(res.msg)}</span>`;
         }

@@ -156,14 +156,20 @@ class Api:
         return parse_account_string(account_str)
 
     def test_dongvan_api(self, account_str, app_type="tiktok"):
-        from auto_login import parse_account_string, get_code_from_dongvanfb
+        from auto_login import parse_account_string, get_code_from_smail1s
         creds = parse_account_string(account_str)
         if not creds:
             return {"ok": False, "msg": "Không thể phân tích định dạng tài khoản!"}
-        if not creds.get("email") or not creds.get("refresh_token") or not creds.get("client_id"):
-            return {"ok": False, "msg": "Thiếu email, refreshToken hoặc clientId!"}
-        
-        res = get_code_from_dongvanfb(creds["email"], creds["refresh_token"], creds["client_id"], app_type)
+        if not creds.get("email"):
+            return {"ok": False, "msg": "Thiếu địa chỉ email để lấy mã OTP!"}
+
+        res = get_code_from_smail1s(
+            email=creds["email"],
+            refresh_token=creds.get("refresh_token", ""),
+            client_id=creds.get("client_id", ""),
+            passmail=creds.get("passmail", ""),
+            app_type=app_type
+        )
         if res.get("status"):
             return {
                 "ok": True,
@@ -171,6 +177,7 @@ class Api:
                 "content": res.get("content", ""),
                 "date": res.get("date", ""),
                 "from": res.get("from", ""),
+                "mail_source": res.get("mail_source", "smail1s"),
                 "creds": {
                     "username": creds.get("username", ""),
                     "email": creds.get("email", ""),
@@ -179,6 +186,23 @@ class Api:
             }
         else:
             return {"ok": False, "msg": res.get("message", "Chưa có thư mới hoặc token hết hạn")}
+
+    def test_2fa_code(self, account_str):
+        from auto_login import parse_account_string, generate_totp_2fa
+        raw = (account_str or "").strip()
+        if not raw:
+            return {"ok": False, "msg": "Vui lòng nhập chuỗi tài khoản hoặc mã bí mật 2FA!"}
+        creds = parse_account_string(raw)
+        secret = (creds.get("two_fa") or "").strip()
+        # Nếu người dùng dán trực tiếp khóa 2FA (không có dấu |)
+        if not secret and "|" not in raw and "@" not in raw:
+            secret = raw
+        if not secret:
+            return {"ok": False, "msg": "Không tìm thấy trường mã bí mật 2FA trong chuỗi tài khoản!"}
+        code, remaining = generate_totp_2fa(secret)
+        if code:
+            return {"ok": True, "code": code, "remaining": remaining, "two_fa": secret}
+        return {"ok": False, "msg": "Mã bí mật 2FA không hợp lệ (phải là chuỗi Base32 A-Z, 2-7)!"}
 
     def clone_profile(self, profile_id):
         cloned = self.profile_mgr.clone_profile(profile_id)
